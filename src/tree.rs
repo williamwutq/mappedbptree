@@ -6,7 +6,7 @@
 
 use std::io;
 use std::marker::PhantomData;
-use std::ops::RangeBounds;
+use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::{RwLock, RwLockReadGuard};
 
@@ -330,6 +330,23 @@ where
         self.store.page(page_idx)[0]
     }
 
+    /// Returns the live key count for any node.
+    #[inline]
+    fn num_keys_of(&self, page_idx: u64) -> usize {
+        let page = self.store.page(page_idx);
+        bytemuck::from_bytes::<NodeHeader>(&page[..NODE_HEADER_SIZE]).num_keys as usize
+    }
+
+    /// Returns the minimum occupancy (keys) for a node.
+    /// Uses ceiling division so the minimum is at least 1 for any capacity ≥ 1.
+    #[inline]
+    fn min_keys_of(&self, page_idx: u64) -> usize {
+        match self.node_kind(page_idx) {
+            NODE_KIND_LEAF => (self.layout.leaf_capacity + 1) / 2,
+            _ => (self.layout.internal_capacity + 1) / 2,
+        }
+    }
+
     /// Returns true if the node at `page_idx` is at maximum capacity.
     #[inline]
     fn node_is_full(&self, page_idx: u64) -> bool {
@@ -342,8 +359,7 @@ where
         }
     }
 
-    /// Returns the child slot to follow for `key` in an internal node,
-    /// using `partition_point` on the live separator keys.
+    /// Returns the child slot to follow for `key` in an internal node.
     ///
     /// Invariant: `separator[i]` is the smallest key in `children[i+1]`, so
     /// the correct child for `key` is `children[partition_point(sep <= key)]`.
@@ -353,6 +369,85 @@ where
         let view = InternalView::<K>::new(page, &self.layout);
         let slot = view.keys().partition_point(|k| k <= key);
         (slot, view.children()[slot])
+    }
+
+    /// Walks from root following `children[0]` at each level to find the
+    /// leftmost leaf.  Returns `(leaf_page, 0)`, or `(NULL_PAGE, 0)` for
+    /// an empty tree.
+    fn first_leaf(&self) -> (u64, usize) {
+        let root = self.store.header().root_page;
+        if root == NULL_PAGE {
+            return (NULL_PAGE, 0);
+        }
+        let mut cur = root;
+        loop {
+            match self.node_kind(cur) {
+                NODE_KIND_LEAF => return (cur, 0),
+                _ => {
+                    let page = self.store.page(cur);
+                    let view = InternalView::<K>::new(page, &self.layout);
+                    cur = view.children()[0];
+                }
+            }
+        }
+    }
+
+    /// Returns `(leaf_page, slot)` where `leaf.keys[slot]` is the first key
+    /// that is `>= key`.  Returns `(NULL_PAGE, 0)` if no such key exists.
+    fn lower_bound(&self, key: &K) -> (u64, usize) {
+        let root = self.store.header().root_page;
+        if root == NULL_PAGE {
+            return (NULL_PAGE, 0);
+        }
+        let mut cur = root;
+        loop {
+            match self.node_kind(cur) {
+                NODE_KIND_LEAF => {
+                    let page = self.store.page(cur);
+                    let view = LeafView::<K, V>::new(page, &self.layout);
+                    let n = view.num_keys();
+                    // first slot where keys[slot] >= key
+                    let slot = view.keys().partition_point(|k| k < key);
+                    if slot < n {
+                        return (cur, slot);
+                    } else {
+                        // all keys in this leaf < key; answer is in next leaf (if any)
+                        return (view.next_leaf(), 0);
+                    }
+                }
+                _ => {
+                    let (_slot, child) = self.internal_child_slot(cur, key);
+                    cur = child;
+                }
+            }
+        }
+    }
+
+    /// Like `lower_bound` but skips past an exact match with `key`
+    /// (implements `Excluded(key)` range start).
+    fn lower_bound_exclusive(&self, key: &K) -> (u64, usize) {
+        let (page, slot) = self.lower_bound(key);
+        if page == NULL_PAGE {
+            return (NULL_PAGE, 0);
+        }
+        // If the key at slot exactly equals `key`, advance one position.
+        let exact = {
+            let p = self.store.page(page);
+            let view = LeafView::<K, V>::new(p, &self.layout);
+            slot < view.num_keys() && &view.keys()[slot] == key
+        };
+        if exact {
+            let p = self.store.page(page);
+            let view = LeafView::<K, V>::new(p, &self.layout);
+            let next_slot = slot + 1;
+            if next_slot < view.num_keys() {
+                (page, next_slot)
+            } else {
+                (view.next_leaf(), 0)
+            }
+        } else {
+            (page, slot)
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -399,18 +494,6 @@ where
     // -----------------------------------------------------------------------
     // insert_impl — proactive top-down split strategy
     // -----------------------------------------------------------------------
-    //
-    // Proactive splits guarantee that every node we descend through already
-    // has room, so we never need to propagate splits upward.
-    //
-    //   1. Empty tree  →  create a leaf root and insert.
-    //   2. Root is full  →  split_root (root page stays at same index but
-    //                        becomes an internal node with two leaf/internal
-    //                        children).
-    //   3. Descend.  Before following each child pointer, if the child is
-    //      full, split it in-place (parent has room because of step 2 /
-    //      prior iterations).
-    //   4. Current node is a leaf  →  leaf_insert.
 
     fn insert_impl(&mut self, key: K, value: V) -> Result<Option<V>> {
         // ── 1. Empty tree ─────────────────────────────────────────────────
@@ -431,14 +514,10 @@ where
                 break;
             }
 
-            // Find the child we would normally descend into.
             let (child_slot, child_idx) = self.internal_child_slot(current, &key);
 
             if self.node_is_full(child_idx) {
-                // Split the child before descending — parent has room.
                 self.split_child(current, child_slot)?;
-                // Re-derive the slot: the split inserted a new separator key
-                // into `current`, potentially shifting our target child.
                 let new_child = {
                     let page = self.store.page(current);
                     let view = InternalView::<K>::new(page, &self.layout);
@@ -455,7 +534,6 @@ where
         self.leaf_insert(current, key, value)
     }
 
-    /// Insert the very first key into an empty tree.
     fn insert_first(&mut self, key: K, value: V) -> Result<Option<V>> {
         let leaf_idx = self.store.alloc_page()?;
         {
@@ -474,15 +552,9 @@ where
     // -----------------------------------------------------------------------
     // split_root
     // -----------------------------------------------------------------------
-    //
-    // The root page stays at its current index but is reinitialised as an
-    // internal node with one separator key and two children.  Both children
-    // are freshly allocated pages containing the left and right halves of
-    // the former root.
 
     fn split_root(&mut self) -> Result<()> {
         let root_idx = self.store.header().root_page;
-
         match self.node_kind(root_idx) {
             NODE_KIND_LEAF => self.split_root_leaf(root_idx),
             _ => self.split_root_internal(root_idx),
@@ -493,20 +565,15 @@ where
         let lc = self.layout.leaf_capacity;
         let mid = lc / 2;
 
-        // Copy everything out of the root page.
         let (all_keys, all_values, old_next) = {
             let page = self.store.page(root_idx);
             let view = LeafView::<K, V>::new(page, &self.layout);
-            // Root is full: num_keys == lc.
-            let keys: Vec<K> = view.keys().to_vec();
-            let vals: Vec<V> = view.values().to_vec();
-            (keys, vals, view.next_leaf())
+            (view.keys().to_vec(), view.values().to_vec(), view.next_leaf())
         };
 
         let left_idx = self.store.alloc_page()?;
         let right_idx = self.store.alloc_page()?;
 
-        // Left leaf: keys/values [0..mid].
         {
             let page = self.store.page_mut(left_idx);
             let mut view = LeafViewMut::<K, V>::new(page, &self.layout);
@@ -517,9 +584,8 @@ where
             view.set_next_leaf(right_idx);
         }
 
-        // Right leaf: keys/values [mid..lc].
         let right_n = lc - mid;
-        let separator = all_keys[mid]; // smallest key in the right child
+        let separator = all_keys[mid];
         {
             let page = self.store.page_mut(right_idx);
             let mut view = LeafViewMut::<K, V>::new(page, &self.layout);
@@ -530,7 +596,6 @@ where
             view.set_next_leaf(old_next);
         }
 
-        // Reinitialise the root page as a 1-key internal node.
         {
             let page = self.store.page_mut(root_idx);
             let mut view = InternalViewMut::<K>::new(page, &self.layout);
@@ -548,18 +613,15 @@ where
         let ic = self.layout.internal_capacity;
         let mid = ic / 2;
 
-        // Copy everything out.
         let (all_keys, all_children) = {
             let page = self.store.page(root_idx);
             let view = InternalView::<K>::new(page, &self.layout);
-            // Root is full: num_keys == ic, num_children == ic+1.
             (view.keys().to_vec(), view.children().to_vec())
         };
 
         let left_idx = self.store.alloc_page()?;
         let right_idx = self.store.alloc_page()?;
 
-        // Left internal: keys [0..mid], children [0..mid+1].
         {
             let page = self.store.page_mut(left_idx);
             let mut view = InternalViewMut::<K>::new(page, &self.layout);
@@ -569,10 +631,7 @@ where
             view.set_num_keys(mid);
         }
 
-        // Separator key is pushed up (not duplicated).
         let separator = all_keys[mid];
-
-        // Right internal: keys [mid+1..ic], children [mid+1..ic+1].
         let right_n = ic - mid - 1;
         {
             let page = self.store.page_mut(right_idx);
@@ -583,7 +642,6 @@ where
             view.set_num_keys(right_n);
         }
 
-        // Reinitialise root as a 1-key internal node.
         {
             let page = self.store.page_mut(root_idx);
             let mut view = InternalViewMut::<K>::new(page, &self.layout);
@@ -598,15 +656,8 @@ where
     }
 
     // -----------------------------------------------------------------------
-    // split_child — splits a full child of `parent_idx` at `child_slot`
+    // split_child
     // -----------------------------------------------------------------------
-    //
-    // After the split:
-    //   parent.children[child_slot]   = left half  (in-place modification)
-    //   parent.children[child_slot+1] = right half (newly allocated)
-    //   parent.keys[child_slot]       = separator  (inserted, shifting right)
-    //
-    // Precondition: parent has room (num_keys < internal_capacity).
 
     fn split_child(&mut self, parent_idx: u64, child_slot: usize) -> Result<()> {
         let child_idx = {
@@ -619,15 +670,10 @@ where
             _ => self.split_internal_child(child_idx)?,
         };
 
-        // Insert separator and right child pointer into parent.
         self.insert_into_internal(parent_idx, child_slot, separator, right_idx);
         Ok(())
     }
 
-    /// Splits the full leaf at `leaf_idx` in-place.
-    ///
-    /// Keeps the left half in `leaf_idx`, allocates a new page for the right
-    /// half.  Returns `(separator_key, right_page_idx)`.
     fn split_leaf_child(&mut self, leaf_idx: u64) -> Result<(K, u64)> {
         let lc = self.layout.leaf_capacity;
         let mid = lc / 2;
@@ -642,7 +688,6 @@ where
         let right_n = lc - mid;
         let separator = all_keys[mid];
 
-        // Write right leaf.
         {
             let page = self.store.page_mut(right_idx);
             let mut view = LeafViewMut::<K, V>::new(page, &self.layout);
@@ -653,7 +698,6 @@ where
             view.set_next_leaf(old_next);
         }
 
-        // Truncate the left leaf and relink.
         {
             let page = self.store.page_mut(leaf_idx);
             let mut view = LeafViewMut::<K, V>::new(page, &self.layout);
@@ -664,11 +708,6 @@ where
         Ok((separator, right_idx))
     }
 
-    /// Splits the full internal node at `node_idx` in-place.
-    ///
-    /// Keeps the left half in `node_idx`, allocates a new page for the right
-    /// half.  The middle key is **pushed up** (not retained in either child).
-    /// Returns `(pushed_up_key, right_page_idx)`.
     fn split_internal_child(&mut self, node_idx: u64) -> Result<(K, u64)> {
         let ic = self.layout.internal_capacity;
         let mid = ic / 2;
@@ -683,7 +722,6 @@ where
         let separator = all_keys[mid];
         let right_n = ic - mid - 1;
 
-        // Write right internal node.
         {
             let page = self.store.page_mut(right_idx);
             let mut view = InternalViewMut::<K>::new(page, &self.layout);
@@ -693,7 +731,6 @@ where
             view.set_num_keys(right_n);
         }
 
-        // Truncate the left internal node (drop keys[mid..] and children[mid+1..]).
         {
             let page = self.store.page_mut(node_idx);
             let mut view = InternalViewMut::<K>::new(page, &self.layout);
@@ -706,11 +743,6 @@ where
     // -----------------------------------------------------------------------
     // insert_into_internal
     // -----------------------------------------------------------------------
-    //
-    // Inserts `key` at position `slot` and `right_child` at `slot+1` in the
-    // internal node at `node_idx`, shifting existing entries right.
-    //
-    // Precondition: num_keys < internal_capacity.
 
     fn insert_into_internal(
         &mut self,
@@ -724,14 +756,11 @@ where
         let n = view.num_keys();
         debug_assert!(n < self.layout.internal_capacity);
 
-        // Shift keys right to make room at `slot`.
         {
             let keys = view.keys_mut();
             keys.copy_within(slot..n, slot + 1);
             keys[slot] = key;
         }
-
-        // Shift children right to make room at `slot+1`.
         {
             let children = view.children_mut();
             children.copy_within(slot + 1..n + 1, slot + 2);
@@ -744,14 +773,8 @@ where
     // -----------------------------------------------------------------------
     // leaf_insert
     // -----------------------------------------------------------------------
-    //
-    // Inserts or updates a key-value pair in an already-confirmed-not-full
-    // leaf.  Shifts existing entries right to maintain sorted order.
-    //
-    // Returns `Some(old_value)` on update, `None` on fresh insert.
 
     fn leaf_insert(&mut self, leaf_idx: u64, key: K, value: V) -> Result<Option<V>> {
-        // Binary search to find the insertion slot.
         let (slot, exists) = {
             let page = self.store.page(leaf_idx);
             let view = LeafView::<K, V>::new(page, &self.layout);
@@ -762,7 +785,6 @@ where
         };
 
         if exists {
-            // Update existing entry.
             let old = {
                 let page = self.store.page(leaf_idx);
                 LeafView::<K, V>::new(page, &self.layout).values()[slot]
@@ -772,7 +794,6 @@ where
             return Ok(Some(old));
         }
 
-        // Fresh insert: shift right and place.
         let page = self.store.page_mut(leaf_idx);
         let mut view = LeafViewMut::<K, V>::new(page, &self.layout);
         let n = view.num_keys();
@@ -795,21 +816,466 @@ where
     }
 
     // -----------------------------------------------------------------------
-    // remove_impl (stub — not yet implemented)
+    // remove_impl — steal-or-merge rebalancing
+    // -----------------------------------------------------------------------
+    //
+    // Strategy: recurse bottom-up.  After deleting from a child, if the child
+    // is underfull, try to steal a key from a sibling; failing that, merge the
+    // child with a sibling.  If the root ends up with 0 keys (only one child
+    // left), collapse it.
+
+    fn remove_impl(&mut self, key: &K) -> Result<Option<V>> {
+        let root = self.store.header().root_page;
+        if root == NULL_PAGE {
+            return Ok(None);
+        }
+
+        let result = match self.node_kind(root) {
+            NODE_KIND_LEAF => self.leaf_delete(root, key)?,
+            _ => self.internal_delete(root, key)?,
+        };
+
+        if result.is_some() {
+            self.store.header_mut().num_entries -= 1;
+
+            // Collapse: root is an internal node with 0 keys → its sole
+            // child becomes the new root.
+            let root = self.store.header().root_page;
+            if self.node_kind(root) != NODE_KIND_LEAF && self.num_keys_of(root) == 0 {
+                let only_child = {
+                    let page = self.store.page(root);
+                    InternalView::<K>::new(page, &self.layout).children()[0]
+                };
+                self.store.free_page(root);
+                self.store.header_mut().root_page = only_child;
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Removes `key` from the leaf at `leaf_idx`.
+    fn leaf_delete(&mut self, leaf_idx: u64, key: &K) -> Result<Option<V>> {
+        let (slot, found) = {
+            let page = self.store.page(leaf_idx);
+            let view = LeafView::<K, V>::new(page, &self.layout);
+            match view.keys().binary_search(key) {
+                Ok(i) => (i, true),
+                Err(_) => (0, false),
+            }
+        };
+        if !found {
+            return Ok(None);
+        }
+
+        let old_val = {
+            let page = self.store.page(leaf_idx);
+            LeafView::<K, V>::new(page, &self.layout).values()[slot]
+        };
+
+        let page = self.store.page_mut(leaf_idx);
+        let mut view = LeafViewMut::<K, V>::new(page, &self.layout);
+        let n = view.num_keys();
+        {
+            let keys = view.keys_mut();
+            keys.copy_within(slot + 1..n, slot);
+        }
+        {
+            let vals = view.values_mut();
+            vals.copy_within(slot + 1..n, slot);
+        }
+        view.set_num_keys(n - 1);
+
+        Ok(Some(old_val))
+    }
+
+    /// Recurses into the subtree at `node_idx` to delete `key`, then
+    /// rebalances if the child that was descended into became underfull.
+    fn internal_delete(&mut self, node_idx: u64, key: &K) -> Result<Option<V>> {
+        let (child_slot, child_idx) = self.internal_child_slot(node_idx, key);
+
+        let result = match self.node_kind(child_idx) {
+            NODE_KIND_LEAF => self.leaf_delete(child_idx, key)?,
+            _ => self.internal_delete(child_idx, key)?,
+        };
+
+        if result.is_some() {
+            let child_n = self.num_keys_of(child_idx);
+            let min = self.min_keys_of(child_idx);
+            if child_n < min {
+                self.fix_underfull_child(node_idx, child_slot);
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Rebalances the child at `child_slot` within `parent_idx`.
+    ///
+    /// Tries to steal from the left sibling, then the right sibling.
+    /// If neither can spare a key, merges the child with a sibling.
+    fn fix_underfull_child(&mut self, parent_idx: u64, child_slot: usize) {
+        let parent_n = self.num_keys_of(parent_idx);
+
+        let child_idx = {
+            let page = self.store.page(parent_idx);
+            InternalView::<K>::new(page, &self.layout).children()[child_slot]
+        };
+        let is_leaf = self.node_kind(child_idx) == NODE_KIND_LEAF;
+        let min = self.min_keys_of(child_idx);
+
+        // ── Try left sibling ──────────────────────────────────────────────
+        if child_slot > 0 {
+            let left_idx = {
+                let page = self.store.page(parent_idx);
+                InternalView::<K>::new(page, &self.layout).children()[child_slot - 1]
+            };
+            if self.num_keys_of(left_idx) > min {
+                let sep_slot = child_slot - 1;
+                if is_leaf {
+                    self.borrow_from_left_leaf(parent_idx, sep_slot, left_idx, child_idx);
+                } else {
+                    self.borrow_from_left_internal(parent_idx, sep_slot, left_idx, child_idx);
+                }
+                return;
+            }
+        }
+
+        // ── Try right sibling ─────────────────────────────────────────────
+        if child_slot < parent_n {
+            let right_idx = {
+                let page = self.store.page(parent_idx);
+                InternalView::<K>::new(page, &self.layout).children()[child_slot + 1]
+            };
+            if self.num_keys_of(right_idx) > min {
+                let sep_slot = child_slot;
+                if is_leaf {
+                    self.borrow_from_right_leaf(parent_idx, sep_slot, child_idx, right_idx);
+                } else {
+                    self.borrow_from_right_internal(parent_idx, sep_slot, child_idx, right_idx);
+                }
+                return;
+            }
+        }
+
+        // ── Merge ─────────────────────────────────────────────────────────
+        if child_slot > 0 {
+            // Merge left sibling + child → left; child is freed.
+            let sep_slot = child_slot - 1;
+            let left_idx = {
+                let page = self.store.page(parent_idx);
+                InternalView::<K>::new(page, &self.layout).children()[child_slot - 1]
+            };
+            if is_leaf {
+                self.merge_leaf_nodes(parent_idx, sep_slot, left_idx, child_idx);
+            } else {
+                self.merge_internal_nodes(parent_idx, sep_slot, left_idx, child_idx);
+            }
+        } else {
+            // Merge child + right sibling → child; right is freed.
+            let sep_slot = child_slot; // == 0
+            let right_idx = {
+                let page = self.store.page(parent_idx);
+                InternalView::<K>::new(page, &self.layout).children()[child_slot + 1]
+            };
+            if is_leaf {
+                self.merge_leaf_nodes(parent_idx, sep_slot, child_idx, right_idx);
+            } else {
+                self.merge_internal_nodes(parent_idx, sep_slot, child_idx, right_idx);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Steal helpers — borrow one entry from a sibling
     // -----------------------------------------------------------------------
 
-    fn remove_impl(&mut self, _key: &K) -> Result<Option<V>> {
-        // TODO: Implement deletion with merge/borrow rebalancing.
-        Ok(None)
+    /// Leaf: move `left`'s last key/value to the front of `child`.
+    /// Update parent separator to the new minimum of `child`.
+    fn borrow_from_left_leaf(
+        &mut self,
+        parent_idx: u64,
+        sep_slot: usize,
+        left_idx: u64,
+        child_idx: u64,
+    ) {
+        let (moved_key, moved_val) = {
+            let page = self.store.page(left_idx);
+            let view = LeafView::<K, V>::new(page, &self.layout);
+            let n = view.num_keys();
+            (view.keys()[n - 1], view.values()[n - 1])
+        };
+
+        // Prepend moved entry to child.
+        {
+            let page = self.store.page_mut(child_idx);
+            let mut view = LeafViewMut::<K, V>::new(page, &self.layout);
+            let n = view.num_keys();
+            let keys = view.keys_mut();
+            keys.copy_within(0..n, 1);
+            keys[0] = moved_key;
+            let vals = view.values_mut();
+            vals.copy_within(0..n, 1);
+            vals[0] = moved_val;
+            view.set_num_keys(n + 1);
+        }
+
+        // Shrink left.
+        {
+            let page = self.store.page_mut(left_idx);
+            let mut view = LeafViewMut::<K, V>::new(page, &self.layout);
+            let n = view.num_keys();
+            view.set_num_keys(n - 1);
+        }
+
+        // New separator = moved_key (the new minimum of child).
+        {
+            let page = self.store.page_mut(parent_idx);
+            let mut view = InternalViewMut::<K>::new(page, &self.layout);
+            view.keys_mut()[sep_slot] = moved_key;
+        }
+    }
+
+    /// Leaf: move `right`'s first key/value to the end of `child`.
+    /// Update parent separator to the new minimum of `right`.
+    fn borrow_from_right_leaf(
+        &mut self,
+        parent_idx: u64,
+        sep_slot: usize,
+        child_idx: u64,
+        right_idx: u64,
+    ) {
+        let (moved_key, moved_val, new_sep) = {
+            let page = self.store.page(right_idx);
+            let view = LeafView::<K, V>::new(page, &self.layout);
+            // right_n > min >= 1 so right_n >= 2, guaranteeing keys[1] is valid.
+            let new_sep = view.keys()[1];
+            (view.keys()[0], view.values()[0], new_sep)
+        };
+
+        // Append to child.
+        {
+            let page = self.store.page_mut(child_idx);
+            let mut view = LeafViewMut::<K, V>::new(page, &self.layout);
+            let n = view.num_keys();
+            view.keys_mut()[n] = moved_key;
+            view.values_mut()[n] = moved_val;
+            view.set_num_keys(n + 1);
+        }
+
+        // Remove first entry from right (shift left).
+        {
+            let page = self.store.page_mut(right_idx);
+            let mut view = LeafViewMut::<K, V>::new(page, &self.layout);
+            let n = view.num_keys();
+            let keys = view.keys_mut();
+            keys.copy_within(1..n, 0);
+            let vals = view.values_mut();
+            vals.copy_within(1..n, 0);
+            view.set_num_keys(n - 1);
+        }
+
+        // New separator = new minimum of right.
+        {
+            let page = self.store.page_mut(parent_idx);
+            let mut view = InternalViewMut::<K>::new(page, &self.layout);
+            view.keys_mut()[sep_slot] = new_sep;
+        }
+    }
+
+    /// Internal: pull down parent separator into front of `child`,
+    /// move `left`'s last key up to parent, move `left`'s last child to `child`.
+    fn borrow_from_left_internal(
+        &mut self,
+        parent_idx: u64,
+        sep_slot: usize,
+        left_idx: u64,
+        child_idx: u64,
+    ) {
+        let (old_sep, left_last_key, left_last_child) = {
+            let parent_page = self.store.page(parent_idx);
+            let parent_view = InternalView::<K>::new(parent_page, &self.layout);
+            let old_sep = parent_view.keys()[sep_slot];
+
+            let left_page = self.store.page(left_idx);
+            let left_view = InternalView::<K>::new(left_page, &self.layout);
+            let ln = left_view.num_keys();
+            (old_sep, left_view.keys()[ln - 1], left_view.children()[ln])
+        };
+
+        // Prepend old_sep + left_last_child to child.
+        {
+            let page = self.store.page_mut(child_idx);
+            let mut view = InternalViewMut::<K>::new(page, &self.layout);
+            let n = view.num_keys();
+            let keys = view.keys_mut();
+            keys.copy_within(0..n, 1);
+            keys[0] = old_sep;
+            let children = view.children_mut();
+            children.copy_within(0..n + 1, 1);
+            children[0] = left_last_child;
+            view.set_num_keys(n + 1);
+        }
+
+        // Shrink left (drop its last key and last child pointer).
+        {
+            let page = self.store.page_mut(left_idx);
+            let mut view = InternalViewMut::<K>::new(page, &self.layout);
+            let n = view.num_keys();
+            view.set_num_keys(n - 1);
+        }
+
+        // Push left_last_key up to parent.
+        {
+            let page = self.store.page_mut(parent_idx);
+            let mut view = InternalViewMut::<K>::new(page, &self.layout);
+            view.keys_mut()[sep_slot] = left_last_key;
+        }
+    }
+
+    /// Internal: pull down parent separator into back of `child`,
+    /// move `right`'s first key up to parent, move `right`'s first child to `child`.
+    fn borrow_from_right_internal(
+        &mut self,
+        parent_idx: u64,
+        sep_slot: usize,
+        child_idx: u64,
+        right_idx: u64,
+    ) {
+        let (old_sep, right_first_key, right_first_child) = {
+            let parent_page = self.store.page(parent_idx);
+            let parent_view = InternalView::<K>::new(parent_page, &self.layout);
+            let old_sep = parent_view.keys()[sep_slot];
+
+            let right_page = self.store.page(right_idx);
+            let right_view = InternalView::<K>::new(right_page, &self.layout);
+            (old_sep, right_view.keys()[0], right_view.children()[0])
+        };
+
+        // Append old_sep + right_first_child to child.
+        {
+            let page = self.store.page_mut(child_idx);
+            let mut view = InternalViewMut::<K>::new(page, &self.layout);
+            let n = view.num_keys();
+            view.keys_mut()[n] = old_sep;
+            view.children_mut()[n + 1] = right_first_child;
+            view.set_num_keys(n + 1);
+        }
+
+        // Shrink right (shift keys and children left by 1).
+        {
+            let page = self.store.page_mut(right_idx);
+            let mut view = InternalViewMut::<K>::new(page, &self.layout);
+            let n = view.num_keys();
+            let keys = view.keys_mut();
+            keys.copy_within(1..n, 0);
+            let children = view.children_mut();
+            children.copy_within(1..n + 1, 0);
+            view.set_num_keys(n - 1);
+        }
+
+        // Push right_first_key up to parent.
+        {
+            let page = self.store.page_mut(parent_idx);
+            let mut view = InternalViewMut::<K>::new(page, &self.layout);
+            view.keys_mut()[sep_slot] = right_first_key;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Merge helpers — absorb right into left, remove separator from parent
+    // -----------------------------------------------------------------------
+
+    /// Merge `right_idx` leaf into `left_idx`.  Removes the separator key at
+    /// `sep_slot` (and the `right_idx` child pointer) from `parent_idx`.
+    /// Frees `right_idx`.
+    fn merge_leaf_nodes(
+        &mut self,
+        parent_idx: u64,
+        sep_slot: usize,
+        left_idx: u64,
+        right_idx: u64,
+    ) {
+        let (right_keys, right_vals, right_next) = {
+            let page = self.store.page(right_idx);
+            let view = LeafView::<K, V>::new(page, &self.layout);
+            let n = view.num_keys();
+            (view.keys()[..n].to_vec(), view.values()[..n].to_vec(), view.next_leaf())
+        };
+
+        {
+            let page = self.store.page_mut(left_idx);
+            let mut view = LeafViewMut::<K, V>::new(page, &self.layout);
+            let ln = view.num_keys();
+            let rn = right_keys.len();
+            view.keys_mut()[ln..ln + rn].copy_from_slice(&right_keys);
+            view.values_mut()[ln..ln + rn].copy_from_slice(&right_vals);
+            view.set_num_keys(ln + rn);
+            view.set_next_leaf(right_next);
+        }
+
+        self.remove_from_internal(parent_idx, sep_slot);
+        self.store.free_page(right_idx);
+    }
+
+    /// Merge `right_idx` internal node into `left_idx`, pulling down the
+    /// separator from `parent_idx`.  Removes separator + right child pointer
+    /// from parent.  Frees `right_idx`.
+    fn merge_internal_nodes(
+        &mut self,
+        parent_idx: u64,
+        sep_slot: usize,
+        left_idx: u64,
+        right_idx: u64,
+    ) {
+        let (sep, right_keys, right_children) = {
+            let parent_page = self.store.page(parent_idx);
+            let parent_view = InternalView::<K>::new(parent_page, &self.layout);
+            let sep = parent_view.keys()[sep_slot];
+
+            let right_page = self.store.page(right_idx);
+            let right_view = InternalView::<K>::new(right_page, &self.layout);
+            let rn = right_view.num_keys();
+            (sep, right_view.keys()[..rn].to_vec(), right_view.children()[..rn + 1].to_vec())
+        };
+
+        {
+            let page = self.store.page_mut(left_idx);
+            let mut view = InternalViewMut::<K>::new(page, &self.layout);
+            let ln = view.num_keys();
+            let rn = right_keys.len();
+            let keys = view.keys_mut();
+            keys[ln] = sep;
+            keys[ln + 1..ln + 1 + rn].copy_from_slice(&right_keys);
+            let children = view.children_mut();
+            children[ln + 1..ln + 1 + rn + 1].copy_from_slice(&right_children);
+            view.set_num_keys(ln + 1 + rn);
+        }
+
+        self.remove_from_internal(parent_idx, sep_slot);
+        self.store.free_page(right_idx);
+    }
+
+    /// Removes the key at `sep_slot` and the child pointer at `sep_slot + 1`
+    /// from the internal node at `node_idx`, shifting remaining entries left.
+    fn remove_from_internal(&mut self, node_idx: u64, sep_slot: usize) {
+        let page = self.store.page_mut(node_idx);
+        let mut view = InternalViewMut::<K>::new(page, &self.layout);
+        let n = view.num_keys();
+        {
+            let keys = view.keys_mut();
+            keys.copy_within(sep_slot + 1..n, sep_slot);
+        }
+        {
+            let children = view.children_mut();
+            children.copy_within(sep_slot + 2..n + 1, sep_slot + 1);
+        }
+        view.set_num_keys(n - 1);
     }
 
     // -----------------------------------------------------------------------
     // clear_impl
     // -----------------------------------------------------------------------
-    //
-    // Walks the tree post-order and returns every page to the free list, then
-    // resets the header.  The file is not truncated; free pages are available
-    // for future inserts.
 
     fn clear_impl(&mut self) -> Result<()> {
         let root = self.store.header().root_page;
@@ -824,14 +1290,12 @@ where
         Ok(())
     }
 
-    /// Recursively frees every page in the subtree rooted at `page_idx`.
     fn free_subtree(&mut self, page_idx: u64) {
         match self.node_kind(page_idx) {
             NODE_KIND_LEAF => {
                 self.store.free_page(page_idx);
             }
             _ => {
-                // Copy children out before freeing the page itself.
                 let children: Vec<u64> = {
                     let page = self.store.page(page_idx);
                     InternalView::<K>::new(page, &self.layout).children().to_vec()
@@ -853,13 +1317,15 @@ where
 ///
 /// Holds a read lock for its lifetime — no writes can proceed concurrently.
 pub struct MmapBTreeIter<'a, K, V> {
-    _guard: RwLockReadGuard<'a, MmapBTreeInner<K, V>>,
-    // TODO: leaf-page cursor: (page_index: u64, slot: usize)
+    guard: RwLockReadGuard<'a, MmapBTreeInner<K, V>>,
+    current_page: u64,
+    current_slot: usize,
 }
 
 impl<'a, K: Ord + Pod, V: Pod> MmapBTreeIter<'a, K, V> {
     fn new(guard: RwLockReadGuard<'a, MmapBTreeInner<K, V>>) -> Self {
-        Self { _guard: guard }
+        let (current_page, current_slot) = guard.first_leaf();
+        Self { guard, current_page, current_slot }
     }
 }
 
@@ -867,8 +1333,33 @@ impl<'a, K: Ord + Pod, V: Pod> Iterator for MmapBTreeIter<'a, K, V> {
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        // TODO: Walk the leaf linked-list via next_leaf pointers.
-        None
+        loop {
+            if self.current_page == NULL_PAGE {
+                return None;
+            }
+
+            // Extract item or advance to next leaf; borrow of guard ends at `}`.
+            let (item, next_page, next_slot) = {
+                let page = self.guard.store.page(self.current_page);
+                let view = LeafView::<K, V>::new(page, &self.guard.layout);
+                let n = view.num_keys();
+                if self.current_slot < n {
+                    let k = view.keys()[self.current_slot];
+                    let v = view.values()[self.current_slot];
+                    (Some((k, v)), self.current_page, self.current_slot + 1)
+                } else {
+                    (None, view.next_leaf(), 0)
+                }
+            };
+
+            self.current_page = next_page;
+            self.current_slot = next_slot;
+
+            if item.is_some() || next_page == NULL_PAGE {
+                return item;
+            }
+            // else: slot overflowed an empty leaf page — advance to next_leaf
+        }
     }
 }
 
@@ -876,16 +1367,32 @@ impl<'a, K: Ord + Pod, V: Pod> Iterator for MmapBTreeIter<'a, K, V> {
 ///
 /// Holds a read lock for its lifetime.
 pub struct MmapBTreeRangeIter<'a, K, V> {
-    _guard: RwLockReadGuard<'a, MmapBTreeInner<K, V>>,
-    // TODO: stored end bound, leaf-page cursor
+    guard: RwLockReadGuard<'a, MmapBTreeInner<K, V>>,
+    current_page: u64,
+    current_slot: usize,
+    /// Inclusive or exclusive upper bound (or unbounded).
+    end_bound: Bound<K>,
 }
 
 impl<'a, K: Ord + Pod, V: Pod> MmapBTreeRangeIter<'a, K, V> {
     fn new<R: RangeBounds<K>>(
         guard: RwLockReadGuard<'a, MmapBTreeInner<K, V>>,
-        _range: R,
+        range: R,
     ) -> Self {
-        Self { _guard: guard }
+        // Copy the end bound (K: Copy via Pod).
+        let end_bound: Bound<K> = match range.end_bound() {
+            Bound::Included(k) => Bound::Included(*k),
+            Bound::Excluded(k) => Bound::Excluded(*k),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+
+        let (current_page, current_slot) = match range.start_bound() {
+            Bound::Included(k) => guard.lower_bound(k),
+            Bound::Excluded(k) => guard.lower_bound_exclusive(k),
+            Bound::Unbounded => guard.first_leaf(),
+        };
+
+        Self { guard, current_page, current_slot, end_bound }
     }
 }
 
@@ -893,8 +1400,45 @@ impl<'a, K: Ord + Pod, V: Pod> Iterator for MmapBTreeRangeIter<'a, K, V> {
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        // TODO: Walk the leaf linked-list, stopping at the end bound.
-        None
+        loop {
+            if self.current_page == NULL_PAGE {
+                return None;
+            }
+
+            let (item, next_page, next_slot) = {
+                let page = self.guard.store.page(self.current_page);
+                let view = LeafView::<K, V>::new(page, &self.guard.layout);
+                let n = view.num_keys();
+                if self.current_slot < n {
+                    let k = view.keys()[self.current_slot];
+                    let v = view.values()[self.current_slot];
+                    (Some((k, v)), self.current_page, self.current_slot + 1)
+                } else {
+                    (None, view.next_leaf(), 0)
+                }
+            };
+
+            self.current_page = next_page;
+            self.current_slot = next_slot;
+
+            if let Some((ref k, _)) = item {
+                let past_end = match &self.end_bound {
+                    Bound::Included(end) => k > end,
+                    Bound::Excluded(end) => k >= end,
+                    Bound::Unbounded => false,
+                };
+                if past_end {
+                    self.current_page = NULL_PAGE; // exhaust iterator
+                    return None;
+                }
+                return item;
+            }
+
+            if next_page == NULL_PAGE {
+                return None;
+            }
+            // else: slot overflowed, loop to next leaf
+        }
     }
 }
 
@@ -964,7 +1508,7 @@ mod tests {
         let old = tree.insert(1, 99).unwrap();
         assert_eq!(old, Some(10));
         assert_eq!(tree.get(&1).unwrap(), Some(99));
-        assert_eq!(tree.len().unwrap(), 1); // count unchanged
+        assert_eq!(tree.len().unwrap(), 1);
     }
 
     #[test]
@@ -1006,7 +1550,6 @@ mod tests {
         tree.clear().unwrap();
         assert!(tree.is_empty().unwrap());
         assert_eq!(tree.get(&0).unwrap(), None);
-        // Can still insert after clear.
         tree.insert(7, 77).unwrap();
         assert_eq!(tree.get(&7).unwrap(), Some(77));
     }
@@ -1025,7 +1568,6 @@ mod tests {
             }
             tree.flush().unwrap();
         }
-        // Re-open and verify data survived.
         let tree = MmapBTreeBuilder::<i32, i32>::new().path(&path).build().unwrap();
         assert_eq!(tree.len().unwrap(), 50);
         for i in 0..50_i32 {
@@ -1054,5 +1596,172 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    // ── remove tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn remove_absent_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open::<i32, i32>(&dir);
+        assert_eq!(tree.remove(&42).unwrap(), None);
+        tree.insert(1, 10).unwrap();
+        assert_eq!(tree.remove(&99).unwrap(), None);
+        assert_eq!(tree.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn remove_only_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open::<i32, i32>(&dir);
+        tree.insert(5, 50).unwrap();
+        assert_eq!(tree.remove(&5).unwrap(), Some(50));
+        assert!(tree.is_empty().unwrap());
+        assert_eq!(tree.get(&5).unwrap(), None);
+    }
+
+    #[test]
+    fn remove_sequential_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open::<i32, i32>(&dir);
+        let n = 500_i32;
+        for i in 0..n {
+            tree.insert(i, i * 2).unwrap();
+        }
+        for i in 0..n {
+            assert_eq!(tree.remove(&i).unwrap(), Some(i * 2), "remove {i}");
+            assert_eq!(tree.len().unwrap(), (n - i - 1) as usize);
+        }
+        assert!(tree.is_empty().unwrap());
+    }
+
+    #[test]
+    fn remove_and_reinsert() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open::<i32, i32>(&dir);
+        for i in 0..200_i32 {
+            tree.insert(i, i).unwrap();
+        }
+        // Remove evens.
+        for i in (0..200_i32).step_by(2) {
+            tree.remove(&i).unwrap();
+        }
+        assert_eq!(tree.len().unwrap(), 100);
+        // Verify odds remain.
+        for i in (1..200_i32).step_by(2) {
+            assert_eq!(tree.get(&i).unwrap(), Some(i));
+        }
+        // Re-insert evens.
+        for i in (0..200_i32).step_by(2) {
+            tree.insert(i, i * 10).unwrap();
+        }
+        assert_eq!(tree.len().unwrap(), 200);
+        for i in (0..200_i32).step_by(2) {
+            assert_eq!(tree.get(&i).unwrap(), Some(i * 10));
+        }
+    }
+
+    #[test]
+    fn remove_reverse_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open::<i32, i32>(&dir);
+        let n = 300_i32;
+        for i in 0..n {
+            tree.insert(i, i).unwrap();
+        }
+        for i in (0..n).rev() {
+            assert_eq!(tree.remove(&i).unwrap(), Some(i), "remove {i}");
+        }
+        assert!(tree.is_empty().unwrap());
+    }
+
+    // ── iter tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn iter_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open::<i32, i32>(&dir);
+        let items: Vec<_> = tree.iter().unwrap().collect();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn iter_single() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open::<i32, i32>(&dir);
+        tree.insert(7, 70).unwrap();
+        let items: Vec<_> = tree.iter().unwrap().collect();
+        assert_eq!(items, vec![(7, 70)]);
+    }
+
+    #[test]
+    fn iter_ascending_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open::<i32, i32>(&dir);
+        let n = 1000_i32;
+        // Insert in reverse order to stress the tree structure.
+        for i in (0..n).rev() {
+            tree.insert(i, i * 3).unwrap();
+        }
+        let items: Vec<_> = tree.iter().unwrap().collect();
+        assert_eq!(items.len(), n as usize);
+        for (idx, (k, v)) in items.iter().enumerate() {
+            assert_eq!(*k, idx as i32);
+            assert_eq!(*v, idx as i32 * 3);
+        }
+        // Verify strict ascending order.
+        for w in items.windows(2) {
+            assert!(w[0].0 < w[1].0);
+        }
+    }
+
+    // ── range tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn range_empty_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open::<i32, i32>(&dir);
+        let items: Vec<_> = tree.range(0..10).unwrap().collect();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn range_included_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open::<i32, i32>(&dir);
+        for i in 0..20_i32 {
+            tree.insert(i, i).unwrap();
+        }
+        // 5..10 → keys 5, 6, 7, 8, 9
+        let items: Vec<_> = tree.range(5..10).unwrap().collect();
+        assert_eq!(items, (5..10).map(|i| (i, i)).collect::<Vec<_>>());
+
+        // 5..=10 → keys 5, 6, 7, 8, 9, 10
+        let items: Vec<_> = tree.range(5..=10).unwrap().collect();
+        assert_eq!(items, (5..=10).map(|i| (i, i)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn range_unbounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open::<i32, i32>(&dir);
+        for i in 0..50_i32 {
+            tree.insert(i, i).unwrap();
+        }
+        let all: Vec<_> = tree.range(..).unwrap().collect();
+        let expected: Vec<_> = (0..50_i32).map(|i| (i, i)).collect();
+        assert_eq!(all, expected);
+    }
+
+    #[test]
+    fn range_no_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open::<i32, i32>(&dir);
+        for i in [1_i32, 2, 3, 10, 11, 12] {
+            tree.insert(i, i).unwrap();
+        }
+        // Range entirely in the gap between 3 and 10.
+        let items: Vec<_> = tree.range(4..10).unwrap().collect();
+        assert!(items.is_empty());
     }
 }
