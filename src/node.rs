@@ -215,6 +215,7 @@ impl<'a, K: Pod, V: Pod> LeafViewMut<'a, K, V> {
 
     /// Read-only slice of live keys (length = `num_keys`).
     #[inline]
+    #[allow(dead_code)]
     pub fn keys(&self) -> &[K] {
         unsafe {
             slice::from_raw_parts(
@@ -226,6 +227,7 @@ impl<'a, K: Pod, V: Pod> LeafViewMut<'a, K, V> {
 
     /// Read-only slice of live values (length = `num_keys`).
     #[inline]
+    #[allow(dead_code)]
     pub fn values(&self) -> &[V] {
         unsafe {
             slice::from_raw_parts(
@@ -383,6 +385,7 @@ impl<'a, K: Pod> InternalViewMut<'a, K> {
 
     /// Read-only slice of live keys (length = `num_keys`).
     #[inline]
+    #[allow(dead_code)]
     pub fn keys(&self) -> &[K] {
         unsafe {
             slice::from_raw_parts(
@@ -394,6 +397,7 @@ impl<'a, K: Pod> InternalViewMut<'a, K> {
 
     /// Read-only slice of live child pointers (length = `num_keys + 1`).
     #[inline]
+    #[allow(dead_code)]
     pub fn children(&self) -> &[u64] {
         unsafe {
             slice::from_raw_parts(
