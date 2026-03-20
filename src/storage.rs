@@ -42,6 +42,14 @@ pub const VERSION: u16 = 1;
 /// Page 0 is the file header, so it is never a valid node page.
 pub const NULL_PAGE: u64 = 0;
 
+/// Number of pages allocated in a single `grow()` call.
+///
+/// When the file needs to expand, allocating this many pages at once amortises
+/// the cost of the `set_len` + mmap-remap across many subsequent `alloc_page`
+/// calls.  The extra pages are pushed onto the free list immediately and
+/// consumed without further remaps until the batch is exhausted.
+pub(crate) const GROW_BATCH: u64 = 64;
+
 /// Default (and currently fixed) page size in bytes.
 pub const PAGE_SIZE: usize = 4096;
 
@@ -443,10 +451,11 @@ impl MmapStore {
 
     /// Allocates a page, returning its index.
     ///
-    /// Pops from the free list if non-empty; otherwise grows the file by one
-    /// page.  The returned page contains whatever bytes were last written to
-    /// it — callers **must** call the appropriate `init()` method on the node
-    /// view before treating it as a valid node.
+    /// Pops from the free list if non-empty; otherwise extends the file by
+    /// [`GROW_BATCH`] pages (one remap), places the extras on the free list,
+    /// and returns the first new page.  The returned page contains whatever
+    /// bytes were last written to it — callers **must** call the appropriate
+    /// `init()` method on the node view before treating it as a valid node.
     ///
     /// # Errors
     ///
@@ -465,11 +474,8 @@ impl MmapStore {
             self.header_mut().free_list_head = next_free;
             Ok(free_head)
         } else {
-            // No free pages — grow the file by one page.
-            // TODO(perf): grow in batches (e.g. 64 pages) to amortise the
-            // cost of file extension and mmap recreation.
-            self.grow()?;
-            Ok(self.total_pages - 1)
+            // No free pages — grow the file by GROW_BATCH pages.
+            self.grow()
         }
     }
 
@@ -508,30 +514,31 @@ impl MmapStore {
     // File growth
     // -----------------------------------------------------------------------
 
-    /// Extends the file by one page and recreates the memory mapping.
+    /// Extends the file by [`GROW_BATCH`] pages, remaps, then pushes all but
+    /// the first new page onto the free list.  Returns the index of the first
+    /// new page (the one that `alloc_page` will hand to its caller).
     ///
-    /// `MmapMut` cannot be resized in place, so the existing mapping is
-    /// replaced with a 1-byte anonymous mapping as a placeholder while the
-    /// file is extended, then a new full mapping is installed.
+    /// Batching amortises the cost of `set_len` + mmap recreation: after one
+    /// `grow` call the next `GROW_BATCH - 1` allocations are satisfied from
+    /// the free list without any syscall or remap overhead.
     ///
     /// # Safety (soundness argument)
     ///
-    /// `grow` takes `&mut self`, which means no other code holds a live
-    /// reference into `self.mmap`.  The swap through `map_anon` keeps
-    /// `self.mmap` in a valid (non-dangling) state at all times.
-    fn grow(&mut self) -> Result<()> {
-        let new_total = self.total_pages + 1;
-        let new_size = new_total as u64 * self.page_size as u64;
+    /// `grow` takes `&mut self`, so no other code holds a live reference into
+    /// `self.mmap`.  The swap through `map_anon(1)` keeps `self.mmap` in a
+    /// valid (non-dangling) state at all times during the file extension.
+    fn grow(&mut self) -> Result<u64> {
+        let first_new = self.total_pages;           // index of the first new page
+        let new_total = first_new + GROW_BATCH;
+        let new_size  = new_total * self.page_size as u64;
 
-        // Replace the existing mapping with a 1-byte anonymous placeholder so
-        // that `self.mmap` is never in an invalid/dangling state during the
-        // file extension.
+        // Swap out the old mapping for a 1-byte anonymous placeholder so that
+        // `self.mmap` is never dangling while `set_len` invalidates the file.
         let old_mmap = std::mem::replace(
             &mut self.mmap,
-            // map_anon allocates anonymous memory — no file, no aliasing.
             MmapMut::map_anon(1).map_err(BTreeError::from)?,
         );
-        drop(old_mmap); // explicit: old mapping is fully released before set_len
+        drop(old_mmap); // fully release before extending the file
 
         self.file.set_len(new_size).map_err(BTreeError::from)?;
 
@@ -541,7 +548,14 @@ impl MmapStore {
         self.total_pages = new_total;
         self.header_mut().num_pages = new_total;
 
-        Ok(())
+        // Push pages [first_new+1 .. new_total] onto the free list so they
+        // are reused on subsequent alloc_page calls without another remap.
+        // Iterate in reverse so the list head ends up at first_new+1 (LIFO).
+        for i in (first_new + 1..new_total).rev() {
+            self.free_page(i);
+        }
+
+        Ok(first_new)
     }
 
     // -----------------------------------------------------------------------
@@ -654,14 +668,20 @@ mod tests {
         let path = dir.path().join("test.db");
         let mut store = MmapStore::open(&path, 4, 4).unwrap();
 
+        // First alloc triggers a batch grow; the file now holds GROW_BATCH
+        // extra pages — no second remap is needed until the batch is drained.
         let p1 = store.alloc_page().unwrap();
-        assert_eq!(p1, 1); // first real page
-        assert_eq!(store.total_pages, 2);
+        assert_ne!(p1, NULL_PAGE);
+        let pages_after_first_grow = store.total_pages;
+        assert_eq!(pages_after_first_grow, 1 + GROW_BATCH); // header + batch
 
+        // Second alloc pops from the free list; total_pages must not change.
         let p2 = store.alloc_page().unwrap();
-        assert_eq!(p2, 2);
+        assert_ne!(p2, NULL_PAGE);
+        assert_ne!(p2, p1);
+        assert_eq!(store.total_pages, pages_after_first_grow); // no second remap
 
-        // Free p1, then re-allocate — should get p1 back.
+        // Free p1, then re-allocate — LIFO free list must return p1.
         store.free_page(p1);
         let p3 = store.alloc_page().unwrap();
         assert_eq!(p3, p1);
