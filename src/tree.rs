@@ -1,8 +1,9 @@
 //! Memory-mapped B+tree implementation with thread-safe concurrent access.
 //!
 //! This module provides the public API ([`MmapBTree`], [`MmapBTreeBuilder`])
-//! and the internal state type [`MmapBTreeInner`].  Storage-level concerns
-//! live in [`crate::storage`]; typed node views live in [`crate::node`].
+//! and the internal implementation of the B+tree algorithms.  The public API
+//! is thread-safe and handles locking; the internal implementation assumes
+//! exclusive mutable access and focuses on the core B+tree logic.
 
 use std::io;
 use std::marker::PhantomData;
