@@ -3,7 +3,7 @@ authors = ["William Wu <williamwutq@gmail.com>", "Claude <claude@anthropic.com>"
 license = "MIT"
 name = "mappedbptree"
 description = "Memory maped (mmap) B+ tree implementation in Rust."
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 [dependencies]
