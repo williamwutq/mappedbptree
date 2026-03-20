@@ -21,7 +21,7 @@
 //!     .build()?;
 //!
 //! tree.insert(1_i32, 42_u64)?;
-//! assert_eq!(tree.get(&1_i32)?, Some(42_u64));
+//! assert_eq!(tree.get_value(&1_i32)?, Some(42_u64));
 //! # Ok::<_, Box<dyn std::error::Error>>(())
 //! ```
 
@@ -29,4 +29,4 @@ pub mod tree;
 pub(crate) mod storage;
 pub(crate) mod node;
 
-pub use tree::{BTreeError, MmapBTree, MmapBTreeBuilder, Result};
+pub use tree::{BTreeError, MmapBTree, MmapBTreeBuilder, MmapBTreeValueRef, Result};

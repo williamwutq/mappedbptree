@@ -7,7 +7,7 @@
 
 use std::io;
 use std::marker::PhantomData;
-use std::ops::{Bound, RangeBounds};
+use std::ops::{Bound, Deref, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::{RwLock, RwLockReadGuard};
 
@@ -120,6 +120,49 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// MmapBTreeValueRef — zero-copy reference into the mmap
+// ---------------------------------------------------------------------------
+
+/// A zero-copy reference to a value stored in the B+tree's memory-mapped file.
+///
+/// Holds the `RwLockReadGuard` that keeps the mapping stable and a raw
+/// pointer to the value inside the mapping.  Derefs to `&V`.
+///
+/// The reference is invalidated if the guard is dropped (i.e. it lives only
+/// as long as the `MmapBTreeValueRef` itself).
+pub struct MmapBTreeValueRef<'a, K: Ord + Pod, V: Pod> {
+    _guard: RwLockReadGuard<'a, MmapBTreeInner<K, V>>,
+    ptr: *const V,
+}
+
+// SAFETY: `ptr` points into the mmap, which is stable while the read guard
+// is held (writes need an exclusive lock to remap).  `V: Pod` ensures the
+// bytes at `ptr` form a valid `V`.
+unsafe impl<K: Ord + Pod + Send + Sync, V: Pod + Send + Sync> Send
+    for MmapBTreeValueRef<'_, K, V>
+{
+}
+unsafe impl<K: Ord + Pod + Send + Sync, V: Pod + Send + Sync> Sync
+    for MmapBTreeValueRef<'_, K, V>
+{
+}
+
+impl<K: Ord + Pod, V: Pod> Deref for MmapBTreeValueRef<'_, K, V> {
+    type Target = V;
+    #[inline]
+    fn deref(&self) -> &V {
+        // SAFETY: see struct-level safety comment.
+        unsafe { &*self.ptr }
+    }
+}
+
+impl<K: Ord + Pod, V: Pod + std::fmt::Debug> std::fmt::Debug for MmapBTreeValueRef<'_, K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.deref().fmt(f)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MmapBTree — public API
 // ---------------------------------------------------------------------------
 
@@ -149,7 +192,7 @@ where
 ///
 /// tree.insert(1, 100)?;
 ///
-/// if let Some(v) = tree.get(&1)? {
+/// if let Some(v) = tree.get_value(&1)? {
 ///     println!("Found: {}", v);
 /// }
 ///
@@ -253,8 +296,18 @@ where
         self.write_guard()?.insert_impl(key, value)
     }
 
-    /// Returns the value for `key`, or `None` if absent.
-    pub fn get(&self, key: &K) -> Result<Option<V>> {
+    /// Returns a zero-copy reference to the value for `key`, or `None` if absent.
+    ///
+    /// The returned [`MmapBTreeValueRef`] holds a read lock on the tree; drop
+    /// it before calling any mutating method to avoid a deadlock.
+    pub fn get(&self, key: &K) -> Result<Option<MmapBTreeValueRef<'_, K, V>>> {
+        let guard = self.read_guard()?;
+        let ptr = guard.get_ptr_impl(key)?;
+        Ok(ptr.map(|ptr| MmapBTreeValueRef { _guard: guard, ptr }))
+    }
+
+    /// Returns a copied value for `key`, or `None` if absent.
+    pub fn get_value(&self, key: &K) -> Result<Option<V>> {
         self.read_guard()?.get_impl(key)
     }
 
@@ -452,7 +505,7 @@ where
     }
 
     // -----------------------------------------------------------------------
-    // get_impl
+    // get_impl / get_ptr_impl
     // -----------------------------------------------------------------------
 
     fn get_impl(&self, key: &K) -> Result<Option<V>> {
@@ -469,6 +522,34 @@ where
                     let view = LeafView::<K, V>::new(page, &self.layout);
                     return Ok(match view.keys().binary_search(key) {
                         Ok(i) => Some(view.values()[i]),
+                        Err(_) => None,
+                    });
+                }
+                _ => {
+                    let (_slot, child) = self.internal_child_slot(current, key);
+                    current = child;
+                }
+            }
+        }
+    }
+
+    /// Like `get_impl` but returns a raw pointer into the mmap instead of
+    /// copying the value.  The pointer is valid as long as the caller holds
+    /// a read lock (which prevents `grow()` from remapping).
+    fn get_ptr_impl(&self, key: &K) -> Result<Option<*const V>> {
+        let root = self.store.header().root_page;
+        if root == NULL_PAGE {
+            return Ok(None);
+        }
+
+        let mut current = root;
+        loop {
+            match self.node_kind(current) {
+                NODE_KIND_LEAF => {
+                    let page = self.store.page(current);
+                    let view = LeafView::<K, V>::new(page, &self.layout);
+                    return Ok(match view.keys().binary_search(key) {
+                        Ok(i) => Some(&view.values()[i] as *const V),
                         Err(_) => None,
                     });
                 }
@@ -1525,7 +1606,7 @@ mod tests {
         let tree = open::<i32, u64>(&dir);
         assert!(tree.is_empty().unwrap());
         assert_eq!(tree.len().unwrap(), 0);
-        assert_eq!(tree.get(&1).unwrap(), None);
+        assert_eq!(tree.get_value(&1).unwrap(), None);
     }
 
     #[test]
@@ -1533,7 +1614,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tree = open::<i32, u64>(&dir);
         assert_eq!(tree.insert(42, 100).unwrap(), None);
-        assert_eq!(tree.get(&42).unwrap(), Some(100));
+        assert_eq!(tree.get_value(&42).unwrap(), Some(100));
         assert_eq!(tree.len().unwrap(), 1);
     }
 
@@ -1544,7 +1625,7 @@ mod tests {
         tree.insert(1, 10).unwrap();
         let old = tree.insert(1, 99).unwrap();
         assert_eq!(old, Some(10));
-        assert_eq!(tree.get(&1).unwrap(), Some(99));
+        assert_eq!(tree.get_value(&1).unwrap(), Some(99));
         assert_eq!(tree.len().unwrap(), 1);
     }
 
@@ -1558,9 +1639,9 @@ mod tests {
         }
         assert_eq!(tree.len().unwrap(), n as usize);
         for i in 0..n {
-            assert_eq!(tree.get(&i).unwrap(), Some(i * 10));
+            assert_eq!(tree.get_value(&i).unwrap(), Some(i * 10));
         }
-        assert_eq!(tree.get(&n).unwrap(), None);
+        assert_eq!(tree.get_value(&n).unwrap(), None);
     }
 
     #[test]
@@ -1572,7 +1653,7 @@ mod tests {
             tree.insert(i, i).unwrap();
         }
         for i in 0..n {
-            assert_eq!(tree.get(&i).unwrap(), Some(i));
+            assert_eq!(tree.get_value(&i).unwrap(), Some(i));
         }
     }
 
@@ -1586,9 +1667,9 @@ mod tests {
         assert_eq!(tree.len().unwrap(), 100);
         tree.clear().unwrap();
         assert!(tree.is_empty().unwrap());
-        assert_eq!(tree.get(&0).unwrap(), None);
+        assert_eq!(tree.get_value(&0).unwrap(), None);
         tree.insert(7, 77).unwrap();
-        assert_eq!(tree.get(&7).unwrap(), Some(77));
+        assert_eq!(tree.get_value(&7).unwrap(), Some(77));
     }
 
     #[test]
@@ -1608,7 +1689,7 @@ mod tests {
         let tree = MmapBTreeBuilder::<i32, i32>::new().path(&path).build().unwrap();
         assert_eq!(tree.len().unwrap(), 50);
         for i in 0..50_i32 {
-            assert_eq!(tree.get(&i).unwrap(), Some(i * 2));
+            assert_eq!(tree.get_value(&i).unwrap(), Some(i * 2));
         }
     }
 
@@ -1625,7 +1706,7 @@ mod tests {
                 let t = Arc::clone(&tree);
                 std::thread::spawn(move || {
                     for i in 0..100_i32 {
-                        assert_eq!(t.get(&i).unwrap(), Some(i));
+                        assert_eq!(t.get_value(&i).unwrap(), Some(i));
                     }
                 })
             })
@@ -1654,7 +1735,7 @@ mod tests {
         tree.insert(5, 50).unwrap();
         assert_eq!(tree.remove(&5).unwrap(), Some(50));
         assert!(tree.is_empty().unwrap());
-        assert_eq!(tree.get(&5).unwrap(), None);
+        assert_eq!(tree.get_value(&5).unwrap(), None);
     }
 
     #[test]
@@ -1686,7 +1767,7 @@ mod tests {
         assert_eq!(tree.len().unwrap(), 100);
         // Verify odds remain.
         for i in (1..200_i32).step_by(2) {
-            assert_eq!(tree.get(&i).unwrap(), Some(i));
+            assert_eq!(tree.get_value(&i).unwrap(), Some(i));
         }
         // Re-insert evens.
         for i in (0..200_i32).step_by(2) {
@@ -1694,7 +1775,7 @@ mod tests {
         }
         assert_eq!(tree.len().unwrap(), 200);
         for i in (0..200_i32).step_by(2) {
-            assert_eq!(tree.get(&i).unwrap(), Some(i * 10));
+            assert_eq!(tree.get_value(&i).unwrap(), Some(i * 10));
         }
     }
 
@@ -1814,7 +1895,7 @@ mod tests {
         }
         assert_eq!(tree.len().unwrap(), 256);
         for i in 0u8..=255 {
-            assert_eq!(tree.get(&i).unwrap(), Some(i.wrapping_mul(3)));
+            assert_eq!(tree.get_value(&i).unwrap(), Some(i.wrapping_mul(3)));
         }
         let items: Vec<_> = tree.iter().unwrap().collect();
         assert_eq!(items.len(), 256);
@@ -1835,7 +1916,7 @@ mod tests {
         }
         assert_eq!(tree.len().unwrap(), keys.len());
         for &k in &keys {
-            assert_eq!(tree.get(&k).unwrap(), Some(k ^ 0xDEAD_BEEF));
+            assert_eq!(tree.get_value(&k).unwrap(), Some(k ^ 0xDEAD_BEEF));
         }
         let items: Vec<_> = tree.iter().unwrap().collect();
         assert_eq!(items.len(), keys.len());
@@ -1879,7 +1960,7 @@ mod tests {
         assert_eq!(tree.len().unwrap(), n as usize);
         for i in 0..n {
             let expected = [i as u64, (i * 2) as u64, (i * 3) as u64, (i * 4) as u64];
-            assert_eq!(tree.get(&i).unwrap(), Some(expected));
+            assert_eq!(tree.get_value(&i).unwrap(), Some(expected));
         }
     }
 
@@ -1894,7 +1975,7 @@ mod tests {
         }
         assert_eq!(tree.len().unwrap(), 50);
         for i in 0..50_i32 {
-            let got = tree.get(&i).unwrap().unwrap();
+            let got = tree.get_value(&i).unwrap().unwrap();
             assert_eq!(got.timestamp, i as u64 * 1000);
             assert_eq!(got.value, i * -1);
             assert_eq!(got.flags, i as u32 & 0xFF);
@@ -1911,9 +1992,9 @@ mod tests {
         tree.insert(0, 0).unwrap();
         tree.insert(i32::MIN, -1).unwrap();
         tree.insert(i32::MAX, 1).unwrap();
-        assert_eq!(tree.get(&i32::MIN).unwrap(), Some(-1));
-        assert_eq!(tree.get(&0).unwrap(), Some(0));
-        assert_eq!(tree.get(&i32::MAX).unwrap(), Some(1));
+        assert_eq!(tree.get_value(&i32::MIN).unwrap(), Some(-1));
+        assert_eq!(tree.get_value(&0).unwrap(), Some(0));
+        assert_eq!(tree.get_value(&i32::MAX).unwrap(), Some(1));
         assert_eq!(tree.len().unwrap(), 3);
 
         let items: Vec<_> = tree.iter().unwrap().collect();
@@ -1952,7 +2033,7 @@ mod tests {
             assert_eq!(old, Some(round - 1));
             assert_eq!(tree.len().unwrap(), 1);
         }
-        assert_eq!(tree.get(&42).unwrap(), Some(100));
+        assert_eq!(tree.get_value(&42).unwrap(), Some(100));
     }
 
     /// `contains_key` is consistent with `get`.
@@ -1969,6 +2050,106 @@ mod tests {
         }
     }
 
+    // ── get (MmapBTreeValueRef) ─────────────────────────────────────────────
+
+    /// `get` on an empty tree returns `None`.
+    #[test]
+    fn get_ref_empty_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open::<i32, u64>(&dir);
+        assert!(tree.get(&1).unwrap().is_none());
+    }
+
+    /// `get` returns `None` for a missing key and `Some` for a present one.
+    #[test]
+    fn get_ref_present_and_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open::<i32, u64>(&dir);
+        tree.insert(10, 99).unwrap();
+        assert!(tree.get(&9).unwrap().is_none());
+        assert!(tree.get(&11).unwrap().is_none());
+        assert_eq!(*tree.get(&10).unwrap().unwrap(), 99_u64);
+    }
+
+    /// The dereffed value equals what `get_value` returns.
+    #[test]
+    fn get_ref_matches_get_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open::<i32, i64>(&dir);
+        for i in 0..50_i32 {
+            tree.insert(i, i as i64 * 3).unwrap();
+        }
+        for i in 0..50_i32 {
+            let by_ref = *tree.get(&i).unwrap().unwrap();
+            let by_val = tree.get_value(&i).unwrap().unwrap();
+            assert_eq!(by_ref, by_val, "mismatch at key {i}");
+        }
+    }
+
+    /// `get` after an update reflects the new value.
+    #[test]
+    fn get_ref_reflects_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open::<i32, i32>(&dir);
+        tree.insert(5, 1).unwrap();
+        tree.insert(5, 2).unwrap();
+        assert_eq!(*tree.get(&5).unwrap().unwrap(), 2);
+    }
+
+    /// `get` after `remove` returns `None`.
+    #[test]
+    fn get_ref_after_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open::<i32, u64>(&dir);
+        tree.insert(7, 42).unwrap();
+        tree.remove(&7).unwrap();
+        assert!(tree.get(&7).unwrap().is_none());
+    }
+
+    /// Multiple simultaneous `get` refs can coexist (all hold read locks).
+    #[test]
+    fn get_ref_multiple_simultaneous() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open::<i32, u64>(&dir);
+        tree.insert(1, 10).unwrap();
+        tree.insert(2, 20).unwrap();
+        tree.insert(3, 30).unwrap();
+        let r1 = tree.get(&1).unwrap().unwrap();
+        let r2 = tree.get(&2).unwrap().unwrap();
+        let r3 = tree.get(&3).unwrap().unwrap();
+        assert_eq!(*r1, 10);
+        assert_eq!(*r2, 20);
+        assert_eq!(*r3, 30);
+    }
+
+    /// `get` works with a Pod struct value.
+    #[test]
+    fn get_ref_pod_struct_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open::<i32, Record>(&dir);
+        let r = Record { timestamp: 999, value: -7, flags: 0xDEAD };
+        tree.insert(42, r).unwrap();
+        let got = tree.get(&42).unwrap().unwrap();
+        assert_eq!(got.timestamp, 999);
+        assert_eq!(got.value, -7);
+        assert_eq!(got.flags, 0xDEAD);
+    }
+
+    /// `get` across many entries (multi-page tree) returns the correct ref.
+    #[test]
+    fn get_ref_large_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open::<i32, i32>(&dir);
+        let n = 1000_i32;
+        for i in 0..n {
+            tree.insert(i, i * 7).unwrap();
+        }
+        for i in 0..n {
+            assert_eq!(*tree.get(&i).unwrap().unwrap(), i * 7, "key {i}");
+        }
+        assert!(tree.get(&n).unwrap().is_none());
+    }
+
     // ── Remove edge cases ───────────────────────────────────────────────────
 
     /// Removing a key that was updated returns the most-recent value.
@@ -1979,7 +2160,7 @@ mod tests {
         tree.insert(7, 10).unwrap();
         tree.insert(7, 20).unwrap();
         assert_eq!(tree.remove(&7).unwrap(), Some(20));
-        assert_eq!(tree.get(&7).unwrap(), None);
+        assert_eq!(tree.get_value(&7).unwrap(), None);
         assert!(tree.is_empty().unwrap());
     }
 
@@ -1992,9 +2173,9 @@ mod tests {
             tree.insert(i, i).unwrap();
         }
         tree.remove(&25).unwrap();
-        assert_eq!(tree.get(&25).unwrap(), None);
+        assert_eq!(tree.get_value(&25).unwrap(), None);
         tree.insert(25, 999).unwrap();
-        assert_eq!(tree.get(&25).unwrap(), Some(999));
+        assert_eq!(tree.get_value(&25).unwrap(), Some(999));
         assert_eq!(tree.len().unwrap(), 50);
     }
 
@@ -2009,10 +2190,10 @@ mod tests {
         }
         assert_eq!(tree.remove(&0).unwrap(), Some(0));
         assert_eq!(tree.len().unwrap(), (n - 1) as usize);
-        assert_eq!(tree.get(&0).unwrap(), None);
+        assert_eq!(tree.get_value(&0).unwrap(), None);
         // Everything else still present.
         for i in 1..n {
-            assert_eq!(tree.get(&i).unwrap(), Some(i), "missing key {i}");
+            assert_eq!(tree.get_value(&i).unwrap(), Some(i), "missing key {i}");
         }
     }
 
@@ -2027,9 +2208,9 @@ mod tests {
         }
         assert_eq!(tree.remove(&(n - 1)).unwrap(), Some(n - 1));
         assert_eq!(tree.len().unwrap(), (n - 1) as usize);
-        assert_eq!(tree.get(&(n - 1)).unwrap(), None);
+        assert_eq!(tree.get_value(&(n - 1)).unwrap(), None);
         for i in 0..n - 1 {
-            assert_eq!(tree.get(&i).unwrap(), Some(i), "missing key {i}");
+            assert_eq!(tree.get_value(&i).unwrap(), Some(i), "missing key {i}");
         }
     }
 
@@ -2047,7 +2228,7 @@ mod tests {
         assert_eq!(tree.len().unwrap(), (n - 1) as usize);
         for i in 0..n {
             let expected = if i == mid { None } else { Some(i * 3) };
-            assert_eq!(tree.get(&i).unwrap(), expected, "key {i}");
+            assert_eq!(tree.get_value(&i).unwrap(), expected, "key {i}");
         }
     }
 
@@ -2296,7 +2477,7 @@ mod tests {
 
         // Point lookup: every key must be found.
         for i in 0..n {
-            assert_eq!(tree.get(&key64(i)).unwrap(), Some(i), "get {i}");
+            assert_eq!(tree.get_value(&key64(i)).unwrap(), Some(i), "get {i}");
         }
 
         // iter() must return all n keys in sorted (big-endian byte) order.
@@ -2369,7 +2550,7 @@ mod tests {
         assert_eq!(tree.len().unwrap(), n as usize);
         // Every key present.
         for i in 0..n {
-            assert_eq!(tree.get(&i).unwrap(), Some(i * 7), "key {i}");
+            assert_eq!(tree.get_value(&i).unwrap(), Some(i * 7), "key {i}");
         }
         // iter still sorted.
         let items: Vec<_> = tree.iter().unwrap().collect();
@@ -2404,7 +2585,7 @@ mod tests {
         }
         // The remaining window is [total-window, total).
         for i in (total - window)..total {
-            assert_eq!(tree.get(&i).unwrap(), Some(i));
+            assert_eq!(tree.get_value(&i).unwrap(), Some(i));
         }
         assert_eq!(tree.len().unwrap(), window as usize);
     }
@@ -2426,7 +2607,7 @@ mod tests {
         // Only odds remain.
         for i in 0..n {
             let exp = if i % 2 == 0 { None } else { Some(i) };
-            assert_eq!(tree.get(&i).unwrap(), exp, "key {i}");
+            assert_eq!(tree.get_value(&i).unwrap(), exp, "key {i}");
         }
         // Remove odds.
         for i in (1..n).step_by(2) {
@@ -2480,7 +2661,7 @@ mod tests {
         let tree = MmapBTreeBuilder::<i32, i32>::new().path(&path).build().unwrap();
         for i in 0..100_i32 {
             let expected = if i % 3 == 0 { None } else { Some(i * 5) };
-            assert_eq!(tree.get(&i).unwrap(), expected, "key {i}");
+            assert_eq!(tree.get_value(&i).unwrap(), expected, "key {i}");
         }
         let expected_len = (0..100_i32).filter(|i| i % 3 != 0).count();
         assert_eq!(tree.len().unwrap(), expected_len);
@@ -2508,8 +2689,8 @@ mod tests {
         {
             let t = MmapBTreeBuilder::<i32, i32>::new().path(&path).build().unwrap();
             assert_eq!(t.len().unwrap(), 150); // 50..200
-            for i in 0..50_i32 { assert_eq!(t.get(&i).unwrap(), None); }
-            for i in 50..200_i32 { assert_eq!(t.get(&i).unwrap(), Some(i)); }
+            for i in 0..50_i32 { assert_eq!(t.get_value(&i).unwrap(), None); }
+            for i in 50..200_i32 { assert_eq!(t.get_value(&i).unwrap(), Some(i)); }
         }
     }
 
@@ -2644,12 +2825,12 @@ mod tests {
 
         // Every key in reference must be found by get().
         for (&k, &v) in &reference {
-            assert_eq!(tree.get(&k).unwrap(), Some(v), "get({k})");
+            assert_eq!(tree.get_value(&k).unwrap(), Some(v), "get({k})");
         }
         // No key outside reference must be found.
         for k in 0..300_i32 {
             let expected = reference.get(&k).copied();
-            assert_eq!(tree.get(&k).unwrap(), expected, "get({k})");
+            assert_eq!(tree.get_value(&k).unwrap(), expected, "get({k})");
         }
 
         // iter() must exactly match reference.
