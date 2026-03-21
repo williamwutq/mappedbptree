@@ -3,12 +3,13 @@ authors = ["William Wu <williamwutq@gmail.com>", "Claude <claude@anthropic.com>"
 license = "MIT"
 name = "mappedbptree"
 description = "Memory maped (mmap) B+ tree implementation in Rust."
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
 memmap2 = "0.9"
 bytemuck = { version = "1", features = ["derive"] }
+crc32fast = "1"
 
 [dev-dependencies]
 tempfile = "3"
