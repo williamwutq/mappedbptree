@@ -479,11 +479,11 @@ where
         MmapBTreeRangeIter::new(guard, range)
     }
 
-    /// Removes all key-value pairs and returns all node pages to the free list.
+    /// Removes all key-value pairs and reclaims all disk space used by node pages.
     ///
-    /// The WAL protocol is **not** used for `clear` because it is not a
-    /// single-key operation.  If the process dies during `clear`, some pages
-    /// may be freed and others not; re-open and retry to finish.
+    /// Implemented as a file truncation: the header is reset to the empty-tree
+    /// state and flushed first, then the file is shrunk to a single page.
+    /// This is O(1) regardless of tree size.
     pub fn clear(&self) -> Result<()> {
         self.write_guard()?.clear_impl()
     }
