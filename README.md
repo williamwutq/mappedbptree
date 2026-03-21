@@ -7,9 +7,14 @@ Built by Claude.
 ## Features
 
 - File-backed storage via `mmap` — data survives process restarts
+- Crash-safe writes with a write-ahead log (WAL) is fsynced before every
+  `insert` or `remove`; an interrupted write is automatically replayed on
+  next open, leaving the tree consistent (since 0.2)
+- Corruption detection — every node page carries a CRC32 checksum;
+  a partial write is detected immediately and reported as an error (since 0.2)
 - Thread-safe: multiple concurrent readers, exclusive writers (`RwLock`)
-- Zero-copy access to keys and values via `bytemuck::Pod`
-- Full B+tree operations: `insert`, `get`, `remove`, `iter`, `range`, `clear`
+- Zero-copy reads via `get` — borrows directly from the mmap without copying
+- Full B+tree operations: `insert`, `get`, `get_value`, `remove`, `iter`, `range`, `clear`
 - Auto-tuned node capacity based on system page size (4096 bytes)
 
 ## Constraints
@@ -22,7 +27,7 @@ no heap allocations. Integers, arrays, and `#[repr(C)]` structs work; `String` a
 
 ```toml
 [dependencies]
-mappedbptree = "0.1"
+mappedbptree = "0.2"
 ```
 
 ```rust
@@ -33,7 +38,7 @@ let tree = MmapBTreeBuilder::<i32, u64>::new()
     .build()?;
 
 tree.insert(1, 100)?;
-assert_eq!(tree.get(&1)?, Some(100));
+assert_eq!(tree.get_value(&1)?, Some(100));
 
 tree.remove(&1)?;
 

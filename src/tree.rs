@@ -1,9 +1,40 @@
-//! Memory-mapped B+tree implementation with thread-safe concurrent access.
+//! Memory-mapped B+tree: public API and algorithm implementation.
 //!
-//! This module provides the public API ([`MmapBTree`], [`MmapBTreeBuilder`])
-//! and the internal implementation of the B+tree algorithms.  The public API
-//! is thread-safe and handles locking; the internal implementation assumes
-//! exclusive mutable access and focuses on the core B+tree logic.
+//! # Module overview
+//!
+//! This module is split into two layers:
+//!
+//! - **Public API** ([`MmapBTree`], [`MmapBTreeBuilder`], [`MmapBTreeValueRef`]) —
+//!   thread-safe, handles locking, WAL writes, and mmap flushes.
+//! - **Internal implementation** (`MmapBTreeInner`, private) — accessed only
+//!   through the `RwLock`; contains the raw B+tree algorithm (insert, remove,
+//!   split, merge, rebalance) operating directly on mmap pages.
+//!
+//! # Crash safety
+//!
+//! Every public write operation follows the WAL protocol:
+//!
+//! 1. Write the intent to `{db}.wal` and call `fsync`.
+//! 2. Mutate the mmap pages (B+tree algorithm).
+//! 3. `msync` the mmap — data is now on disk.
+//! 4. Delete the WAL file — the operation is committed.
+//!
+//! If the process is killed between steps 1 and 4, the next call to
+//! [`MmapBTreeBuilder::build`] replays the WAL and brings the tree to the
+//! post-operation state.  If the process is killed before step 1, the tree
+//! is in its clean pre-operation state.  Either way, no corruption.
+//!
+//! # Corruption detection
+//!
+//! Every node page (version 2+) carries a CRC32 checksum covering all page
+//! bytes except the 4-byte checksum field itself.  The checksum is written
+//! after every page mutation.  It is verified before any page is read during
+//! a traversal; a mismatch returns [`BTreeError::Corruption`] immediately
+//! rather than silently reading wrong data.
+//!
+//! Version-1 files are automatically upgraded to version 2 on first open:
+//! checksums are computed for all live node pages and the on-disk version
+//! field is bumped.
 
 use std::io;
 use std::marker::PhantomData;
@@ -26,13 +57,21 @@ use crate::wal;
 // ---------------------------------------------------------------------------
 
 /// Errors that can occur during B+tree operations.
+///
+/// The two most common variants are [`Io`](Self::Io) (file-system failures)
+/// and [`Corruption`](Self::Corruption) (bad page checksums, bad magic, or
+/// other structural inconsistencies detected in the on-disk data).
 #[derive(Debug, Clone)]
 pub enum BTreeError {
-    /// An I/O error from file operations.
+    /// An I/O error from file, mmap, or fsync operations.
     Io(String),
     /// Structural corruption detected in the on-disk tree.
+    ///
+    /// Triggered by a CRC32 checksum mismatch, a bad file header, or any
+    /// page layout inconsistency.  This typically indicates a partial write
+    /// that was not replayed by the WAL (e.g. the WAL file itself was lost).
     Corruption(String),
-    /// Other operation errors (e.g. poisoned lock).
+    /// Other errors (e.g. a poisoned `RwLock`).
     Other(String),
 }
 
@@ -63,6 +102,9 @@ pub type Result<T> = std::result::Result<T, BTreeError>;
 
 /// Configuration builder for [`MmapBTree`].
 ///
+/// Start with [`MmapBTreeBuilder::new`], set a storage path, then call
+/// [`build`](Self::build) to open (or create) the tree.
+///
 /// # Example
 ///
 /// ```no_run
@@ -90,8 +132,9 @@ where
 
     /// Sets the file path for the B+tree storage.
     ///
-    /// If the file does not exist it will be created.
-    /// If it exists it will be opened and validated.
+    /// If the file does not exist it will be created and initialised with an
+    /// empty tree.  If it exists it will be opened, its header validated, and
+    /// any pending WAL record replayed before the tree is returned.
     pub fn path<P: AsRef<Path>>(mut self, path: P) -> Self {
         self.path = Some(path.as_ref().to_path_buf());
         self
@@ -99,10 +142,16 @@ where
 
     /// Builds and returns the [`MmapBTree`].
     ///
+    /// This is the terminal step that opens (or creates) the backing file,
+    /// runs version migration if needed, and replays any leftover WAL record
+    /// from a previous crash.
+    ///
     /// # Errors
     ///
     /// - [`BTreeError::Io`] — file cannot be created or opened.
-    /// - [`BTreeError::Corruption`] — existing file has a bad header.
+    /// - [`BTreeError::Corruption`] — existing file has a bad header or
+    ///   incompatible key/value sizes.
+    /// - [`BTreeError::Other`] — [`path`](Self::path) was not called.
     pub fn build(self) -> Result<MmapBTree<K, V>> {
         let path = self.path.ok_or_else(|| {
             BTreeError::Other("Path must be set via .path()".to_string())
@@ -127,11 +176,13 @@ where
 
 /// A zero-copy reference to a value stored in the B+tree's memory-mapped file.
 ///
-/// Holds the `RwLockReadGuard` that keeps the mapping stable and a raw
-/// pointer to the value inside the mapping.  Derefs to `&V`.
+/// Returned by [`MmapBTree::get`].  Dereferences to `&V` without copying the
+/// value out of the mmap.
 ///
-/// The reference is invalidated if the guard is dropped (i.e. it lives only
-/// as long as the `MmapBTreeValueRef` itself).
+/// Internally this holds the `RwLockReadGuard` that pins the mapping in place.
+/// Because of this, **no write operation can proceed while a `MmapBTreeValueRef`
+/// is alive** — drop it before calling `insert`, `remove`, or `clear` to avoid
+/// a deadlock.
 pub struct MmapBTreeValueRef<'a, K: Ord + Pod, V: Pod> {
     _guard: RwLockReadGuard<'a, MmapBTreeInner<K, V>>,
     ptr: *const V,
@@ -168,20 +219,28 @@ impl<K: Ord + Pod, V: Pod + std::fmt::Debug> std::fmt::Debug for MmapBTreeValueR
 // MmapBTree — public API
 // ---------------------------------------------------------------------------
 
-/// A memory-mapped, persistent B+tree supporting thread-safe concurrent reads.
+/// A memory-mapped, persistent, crash-safe B+tree.
 ///
 /// ## Type constraints
 ///
-/// Both `K` and `V` must implement [`bytemuck::Pod`], which guarantees they
-/// are plain-data types safe to store as raw bytes in an mmap file.
-/// `bytemuck::Pod` implies `Copy + Clone + Sized`.
-///
-/// `K` additionally requires [`Ord`] for tree ordering.
+/// Both `K` and `V` must implement [`bytemuck::Pod`], ensuring they are
+/// plain-data types safe to store as raw bytes.  `K` additionally requires
+/// [`Ord`] for tree ordering.
 ///
 /// ## Thread safety
 ///
-/// An [`RwLock`] wraps the internal state: multiple threads may read
-/// concurrently, but writes are exclusive.
+/// An internal `RwLock` allows multiple concurrent readers; writes are
+/// exclusive.  Iterators and [`MmapBTreeValueRef`] hold a read lock for their
+/// lifetime — drop them before writing.
+///
+/// ## Crash safety
+///
+/// `insert` and `remove` are protected by a write-ahead log (WAL) fsynced
+/// before any mmap mutation.  If the process dies mid-write, the pending
+/// operation is replayed automatically the next time the tree is opened.
+/// Every node page also carries a CRC32 checksum; a partial write that
+/// corrupts a page is detected on the next read and reported as
+/// [`BTreeError::Corruption`].
 ///
 /// ## Example
 ///
@@ -194,12 +253,16 @@ impl<K: Ord + Pod, V: Pod + std::fmt::Debug> std::fmt::Debug for MmapBTreeValueR
 ///
 /// tree.insert(1, 100)?;
 ///
-/// if let Some(v) = tree.get_value(&1)? {
-///     println!("Found: {}", v);
+/// // Zero-copy access (holds read lock until dropped).
+/// if let Some(v) = tree.get(&1)? {
+///     println!("Found: {}", *v);
 /// }
 ///
+/// // Copied access — no lock held after the call.
+/// assert_eq!(tree.get_value(&1)?, Some(100));
+///
 /// for (k, v) in tree.range(1..10)? {
-///     println!("{}: {}", k, v);
+///     println!("{k}: {v}");
 /// }
 ///
 /// tree.remove(&1)?;
@@ -342,8 +405,12 @@ where
 
     /// Returns a zero-copy reference to the value for `key`, or `None` if absent.
     ///
-    /// The returned [`MmapBTreeValueRef`] holds a read lock on the tree; drop
-    /// it before calling any mutating method to avoid a deadlock.
+    /// The returned [`MmapBTreeValueRef`] borrows directly from the mmap and
+    /// holds a read lock on the tree.  Drop it before calling any mutating
+    /// method (`insert`, `remove`, `clear`) to avoid a deadlock.
+    ///
+    /// Use [`get_value`](Self::get_value) if you only need a copy and don't
+    /// want to worry about the lock.
     pub fn get(&self, key: &K) -> Result<Option<MmapBTreeValueRef<'_, K, V>>> {
         let guard = self.read_guard()?;
         let ptr = guard.get_ptr_impl(key)?;
@@ -351,6 +418,9 @@ where
     }
 
     /// Returns a copied value for `key`, or `None` if absent.
+    ///
+    /// Unlike [`get`](Self::get), this copies the value out and releases the
+    /// read lock immediately.  Prefer this when you don't need zero-copy access.
     pub fn get_value(&self, key: &K) -> Result<Option<V>> {
         self.read_guard()?.get_impl(key)
     }
@@ -389,8 +459,9 @@ where
 
     /// Returns an iterator over all key-value pairs in ascending key order.
     ///
-    /// Holds a read lock for its entire lifetime — writes are blocked until
-    /// the iterator is dropped.
+    /// The iterator holds a read lock for its entire lifetime; writes are
+    /// blocked until it is dropped.  Collect into a `Vec` if you need to
+    /// write while iterating.
     pub fn iter(&self) -> Result<MmapBTreeIter<'_, K, V>> {
         let guard = self.read_guard()?;
         Ok(MmapBTreeIter::new(guard))
@@ -398,7 +469,8 @@ where
 
     /// Returns an iterator over key-value pairs whose keys fall within `range`.
     ///
-    /// Holds a read lock for its entire lifetime.
+    /// Accepts any `RangeBounds<K>`: `..`, `a..`, `..b`, `a..b`, `a..=b`, etc.
+    /// The iterator holds a read lock for its entire lifetime.
     pub fn range<R: RangeBounds<K>>(
         &self,
         range: R,
@@ -407,15 +479,21 @@ where
         MmapBTreeRangeIter::new(guard, range)
     }
 
-    /// Removes all key-value pairs and frees all node pages.
+    /// Removes all key-value pairs and returns all node pages to the free list.
+    ///
+    /// The WAL protocol is **not** used for `clear` because it is not a
+    /// single-key operation.  If the process dies during `clear`, some pages
+    /// may be freed and others not; re-open and retry to finish.
     pub fn clear(&self) -> Result<()> {
         self.write_guard()?.clear_impl()
     }
 
-    /// Flushes all pending writes to disk.
+    /// Flushes all pending mmap writes to disk (`msync`).
     ///
-    /// Called automatically on drop (best-effort), but may be called
-    /// explicitly to guarantee durability.
+    /// The WAL protocol already calls `msync` after every `insert` and
+    /// `remove`, so explicit `flush` is rarely needed.  It is called
+    /// automatically on drop (best-effort); call it explicitly when you need
+    /// a strong durability guarantee outside a write operation.
     pub fn flush(&self) -> Result<()> {
         self.read_guard()?.flush_impl()
     }

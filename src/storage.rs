@@ -3,22 +3,40 @@
 //! # File layout
 //!
 //! ```text
-//! Page 0:  FileHeader  (PAGE_SIZE bytes, only first 64 bytes are meaningful)
+//! Page 0:  FileHeader  (PAGE_SIZE bytes; only the first 64 bytes are used)
 //! Page 1:  node page
 //! Page 2:  node page
 //! ...
 //! ```
 //!
-//! Page index `0` is reserved for the file header and is never used as a
-//! node page. It therefore serves as a natural null/sentinel value:
-//! `NULL_PAGE = 0`.
+//! Page 0 is always the file header and is **never** a node page.  Its index
+//! (`0`) therefore doubles as the null/sentinel value: [`NULL_PAGE`].
 //!
 //! # Node page layout
 //!
-//! Every node page starts with a [`NodeHeader`] (16 bytes), followed by
-//! keys, then values (leaf) or child page indices (internal). Offsets are
-//! computed by [`NodeLayout`] to satisfy alignment requirements of `K` and
-//! `V`.
+//! Every node page starts with a [`NodeHeader`] (16 bytes), followed by a
+//! packed key array, then either a value array (leaf) or a child-pointer
+//! array (internal).  Exact byte offsets are computed by [`NodeLayout`] at
+//! open time to satisfy the alignment requirements of `K` and `V`.
+//!
+//! # Checksums (version 2)
+//!
+//! [`NodeHeader::checksum`] (bytes 4–7 of each page) stores a CRC32 of all
+//! other bytes in the page.  It is written by [`write_page_checksum`] after
+//! every page mutation and verified by [`verify_page_checksum`] before any
+//! read.  A mismatch indicates a partial write (e.g. from a power loss) that
+//! was not protected by the WAL and causes the caller to return
+//! [`BTreeError::Corruption`].
+//!
+//! Version-1 files (no checksums) are automatically upgraded to version 2
+//! on first open via a linear scan of all live pages.
+//!
+//! # Versioning
+//!
+//! | Version | Change |
+//! |---------|--------|
+//! | 1       | Initial format |
+//! | 2       | Per-page CRC32 checksums in `NodeHeader.checksum` |
 
 use std::fs::{File, OpenOptions};
 use std::path::Path;
@@ -279,9 +297,14 @@ fn compute_internal_capacity(
 
 /// Manages the memory-mapped file backing the B+tree.
 ///
-/// `MmapStore` is not generic: it deals only in raw byte pages.  The typed
-/// node views ([`crate::node`]) are constructed by callers that know `K` and
-/// `V`.
+/// `MmapStore` is not generic — it operates on raw `[u8]` pages.  Typed
+/// node views are constructed by [`crate::node`] code that knows `K` and `V`.
+///
+/// Responsibilities:
+/// - Owns the `File` and `MmapMut`; enforces page-granular access.
+/// - Manages page allocation (free list + file growth).
+/// - Exposes [`checksums_enabled`](Self::checksums_enabled) so callers know
+///   whether to call [`write_page_checksum`] and [`verify_page_checksum`].
 pub struct MmapStore {
     file: File,
     mmap: MmapMut,
@@ -306,15 +329,18 @@ impl std::fmt::Debug for MmapStore {
 impl MmapStore {
     /// Opens the file at `path`, creating it if it does not exist.
     ///
-    /// On creation, writes an initial [`FileHeader`] but does **not**
-    /// allocate a root page; the tree starts empty (`root_page = NULL_PAGE`).
-    ///
-    /// On open, validates the magic, version, key size, and value size.
+    /// - **New file**: writes an initial [`FileHeader`] (version 2) with an
+    ///   empty root (`root_page = NULL_PAGE`) and enables checksums.
+    /// - **Existing file**: validates magic, version, page size, and key/value
+    ///   sizes.  Version-1 files are automatically upgraded to version 2:
+    ///   checksums are written to all live node pages and the version field is
+    ///   bumped and flushed before returning.
     ///
     /// # Errors
     ///
-    /// Returns [`BTreeError::Io`] on any file-system failure, or
-    /// [`BTreeError::Corruption`] if the existing file is malformed.
+    /// - [`BTreeError::Io`] — file-system failure.
+    /// - [`BTreeError::Corruption`] — bad magic, unsupported version, or
+    ///   key/value size mismatch.
     pub fn open(path: &Path, key_size: usize, value_size: usize) -> Result<Self> {
         let file_exists = path.exists() && {
             let meta = std::fs::metadata(path).map_err(BTreeError::from)?;
