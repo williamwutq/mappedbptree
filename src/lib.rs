@@ -28,5 +28,6 @@
 pub mod tree;
 pub(crate) mod storage;
 pub(crate) mod node;
+pub(crate) mod wal;
 
 pub use tree::{BTreeError, MmapBTree, MmapBTreeBuilder, MmapBTreeValueRef, Result};

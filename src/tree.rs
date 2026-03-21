@@ -17,7 +17,9 @@ use crate::node::{InternalView, InternalViewMut, LeafView, LeafViewMut};
 use crate::storage::{
     MmapStore, NodeHeader, NodeLayout, NODE_HEADER_SIZE, NODE_KIND_LEAF,
     NULL_PAGE, PAGE_SIZE,
+    write_page_checksum, verify_page_checksum,
 };
+use crate::wal;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -205,6 +207,8 @@ impl<K: Ord + Pod, V: Pod + std::fmt::Debug> std::fmt::Debug for MmapBTreeValueR
 /// ```
 pub struct MmapBTree<K, V> {
     inner: RwLock<MmapBTreeInner<K, V>>,
+    /// Absolute path to the database file; used to derive the WAL path.
+    db_path: PathBuf,
 }
 
 // ---------------------------------------------------------------------------
@@ -246,25 +250,48 @@ where
     V: Pod,
 {
     fn open(path: PathBuf) -> Result<Self> {
-        let store = MmapStore::open(
-            &path,
-            std::mem::size_of::<K>(),
-            std::mem::size_of::<V>(),
-        )?;
+        let key_size   = std::mem::size_of::<K>();
+        let value_size = std::mem::size_of::<V>();
+
+        let store = MmapStore::open(&path, key_size, value_size)?;
         let layout = NodeLayout::new(
             PAGE_SIZE,
-            std::mem::size_of::<K>(),
+            key_size,
             std::mem::align_of::<K>(),
-            std::mem::size_of::<V>(),
+            value_size,
             std::mem::align_of::<V>(),
         );
-        Ok(Self {
-            inner: RwLock::new(MmapBTreeInner {
-                store,
-                layout,
-                _phantom: PhantomData,
-            }),
-        })
+
+        let mut inner = MmapBTreeInner { store, layout, _phantom: PhantomData };
+
+        // WAL recovery: if a WAL file is present, replay the pending operation.
+        // Both insert and remove are idempotent, so replay is always safe.
+        // BTreeError::Corruption during redo means the partial write didn't
+        // reach disk — the tree is in a clean pre-crash state, which is fine.
+        if let Some(record) = wal::read_existing(&path, key_size, value_size)? {
+            match record.op {
+                wal::WAL_OP_INSERT => {
+                    let k: K = *bytemuck::from_bytes(&record.key);
+                    let v: V = *bytemuck::from_bytes(&record.value);
+                    match inner.insert_impl(k, v) {
+                        Ok(_) | Err(BTreeError::Corruption(_)) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                wal::WAL_OP_REMOVE => {
+                    let k: K = *bytemuck::from_bytes(&record.key);
+                    match inner.remove_impl(&k) {
+                        Ok(_) | Err(BTreeError::Corruption(_)) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                _ => {} // corrupt/unknown WAL op — ignore
+            }
+            inner.store.flush()?;
+            wal::delete(&path)?;
+        }
+
+        Ok(Self { inner: RwLock::new(inner), db_path: path })
     }
 
     fn write_guard(
@@ -292,8 +319,25 @@ where
     V: Pod,
 {
     /// Inserts `key` → `value`.  Returns the previous value if the key existed.
+    ///
+    /// Crash-safe: a WAL record is written and fsynced before any mmap
+    /// mutation.  If the process dies mid-write, the operation is replayed
+    /// automatically the next time the tree is opened.
     pub fn insert(&self, key: K, value: V) -> Result<Option<V>> {
-        self.write_guard()?.insert_impl(key, value)
+        // Step 1: write intent to WAL and fsync.
+        wal::write_and_sync(
+            &self.db_path,
+            wal::WAL_OP_INSERT,
+            bytemuck::bytes_of(&key),
+            bytemuck::bytes_of(&value),
+        )?;
+        // Step 2: perform the mmap mutation.
+        let result = self.write_guard()?.insert_impl(key, value)?;
+        // Step 3: msync the mmap (must happen before WAL deletion).
+        self.read_guard()?.flush_impl()?;
+        // Step 4: delete the WAL — operation is now durable.
+        wal::delete(&self.db_path)?;
+        Ok(result)
     }
 
     /// Returns a zero-copy reference to the value for `key`, or `None` if absent.
@@ -317,8 +361,20 @@ where
     }
 
     /// Removes `key` and returns its value, or `None` if absent.
+    ///
+    /// Crash-safe: same WAL protocol as [`insert`](Self::insert).
     pub fn remove(&self, key: &K) -> Result<Option<V>> {
-        self.write_guard()?.remove_impl(key)
+        let zero_value = vec![0u8; std::mem::size_of::<V>()];
+        wal::write_and_sync(
+            &self.db_path,
+            wal::WAL_OP_REMOVE,
+            bytemuck::bytes_of(key),
+            &zero_value,
+        )?;
+        let result = self.write_guard()?.remove_impl(key)?;
+        self.read_guard()?.flush_impl()?;
+        wal::delete(&self.db_path)?;
+        Ok(result)
     }
 
     /// Returns the number of key-value pairs.
@@ -348,7 +404,7 @@ where
         range: R,
     ) -> Result<MmapBTreeRangeIter<'_, K, V>> {
         let guard = self.read_guard()?;
-        Ok(MmapBTreeRangeIter::new(guard, range))
+        MmapBTreeRangeIter::new(guard, range)
     }
 
     /// Removes all key-value pairs and frees all node pages.
@@ -377,6 +433,22 @@ where
     // -----------------------------------------------------------------------
     // Small utilities
     // -----------------------------------------------------------------------
+
+    /// Verifies the CRC32 checksum of the page at `page_idx`.
+    ///
+    /// Returns [`BTreeError::Corruption`] if the checksum doesn't match.
+    /// No-op when `checksums_enabled` is false (version-1 files before upgrade).
+    #[inline]
+    fn verify_page(&self, page_idx: u64) -> Result<()> {
+        if self.store.checksums_enabled
+            && !verify_page_checksum(self.store.page(page_idx))
+        {
+            return Err(BTreeError::Corruption(format!(
+                "checksum mismatch on page {page_idx}"
+            )));
+        }
+        Ok(())
+    }
 
     /// Returns the kind byte of the node at `page_idx`.
     #[inline]
@@ -413,16 +485,19 @@ where
         }
     }
 
-    /// Returns the child slot to follow for `key` in an internal node.
+    /// Returns `(slot, child_page)` to follow for `key` in an internal node.
     ///
     /// Invariant: `separator[i]` is the smallest key in `children[i+1]`, so
     /// the correct child for `key` is `children[partition_point(sep <= key)]`.
+    ///
+    /// Returns [`BTreeError::Corruption`] if the page checksum is invalid.
     #[inline]
-    fn internal_child_slot(&self, page_idx: u64, key: &K) -> (usize, u64) {
+    fn internal_child_slot(&self, page_idx: u64, key: &K) -> Result<(usize, u64)> {
+        self.verify_page(page_idx)?;
         let page = self.store.page(page_idx);
         let view = InternalView::<K>::new(page, &self.layout);
         let slot = view.keys().partition_point(|k| k <= key);
-        (slot, view.children()[slot])
+        Ok((slot, view.children()[slot]))
     }
 
     /// Walks from root following `children[0]` at each level to find the
@@ -448,10 +523,10 @@ where
 
     /// Returns `(leaf_page, slot)` where `leaf.keys[slot]` is the first key
     /// that is `>= key`.  Returns `(NULL_PAGE, 0)` if no such key exists.
-    fn lower_bound(&self, key: &K) -> (u64, usize) {
+    fn lower_bound(&self, key: &K) -> Result<(u64, usize)> {
         let root = self.store.header().root_page;
         if root == NULL_PAGE {
-            return (NULL_PAGE, 0);
+            return Ok((NULL_PAGE, 0));
         }
         let mut cur = root;
         loop {
@@ -463,14 +538,14 @@ where
                     // first slot where keys[slot] >= key
                     let slot = view.keys().partition_point(|k| k < key);
                     if slot < n {
-                        return (cur, slot);
+                        return Ok((cur, slot));
                     } else {
                         // all keys in this leaf < key; answer is in next leaf (if any)
-                        return (view.next_leaf(), 0);
+                        return Ok((view.next_leaf(), 0));
                     }
                 }
                 _ => {
-                    let (_slot, child) = self.internal_child_slot(cur, key);
+                    let (_slot, child) = self.internal_child_slot(cur, key)?;
                     cur = child;
                 }
             }
@@ -479,10 +554,10 @@ where
 
     /// Like `lower_bound` but skips past an exact match with `key`
     /// (implements `Excluded(key)` range start).
-    fn lower_bound_exclusive(&self, key: &K) -> (u64, usize) {
-        let (page, slot) = self.lower_bound(key);
+    fn lower_bound_exclusive(&self, key: &K) -> Result<(u64, usize)> {
+        let (page, slot) = self.lower_bound(key)?;
         if page == NULL_PAGE {
-            return (NULL_PAGE, 0);
+            return Ok((NULL_PAGE, 0));
         }
         // If the key at slot exactly equals `key`, advance one position.
         let exact = {
@@ -495,12 +570,12 @@ where
             let view = LeafView::<K, V>::new(p, &self.layout);
             let next_slot = slot + 1;
             if next_slot < view.num_keys() {
-                (page, next_slot)
+                Ok((page, next_slot))
             } else {
-                (view.next_leaf(), 0)
+                Ok((view.next_leaf(), 0))
             }
         } else {
-            (page, slot)
+            Ok((page, slot))
         }
     }
 
@@ -518,6 +593,7 @@ where
         loop {
             match self.node_kind(current) {
                 NODE_KIND_LEAF => {
+                    self.verify_page(current)?;
                     let page = self.store.page(current);
                     let view = LeafView::<K, V>::new(page, &self.layout);
                     return Ok(match view.keys().binary_search(key) {
@@ -526,7 +602,7 @@ where
                     });
                 }
                 _ => {
-                    let (_slot, child) = self.internal_child_slot(current, key);
+                    let (_slot, child) = self.internal_child_slot(current, key)?;
                     current = child;
                 }
             }
@@ -546,6 +622,7 @@ where
         loop {
             match self.node_kind(current) {
                 NODE_KIND_LEAF => {
+                    self.verify_page(current)?;
                     let page = self.store.page(current);
                     let view = LeafView::<K, V>::new(page, &self.layout);
                     return Ok(match view.keys().binary_search(key) {
@@ -554,7 +631,7 @@ where
                     });
                 }
                 _ => {
-                    let (_slot, child) = self.internal_child_slot(current, key);
+                    let (_slot, child) = self.internal_child_slot(current, key)?;
                     current = child;
                 }
             }
@@ -596,7 +673,7 @@ where
                 break;
             }
 
-            let (child_slot, child_idx) = self.internal_child_slot(current, &key);
+            let (child_slot, child_idx) = self.internal_child_slot(current, &key)?;
 
             if self.node_is_full(child_idx) {
                 self.split_child(current, child_slot)?;
@@ -626,6 +703,7 @@ where
             view.values_mut()[0] = value;
             view.set_num_keys(1);
         }
+        write_page_checksum(self.store.page_mut(leaf_idx));
         self.store.header_mut().root_page = leaf_idx;
         self.store.header_mut().num_entries = 1;
         Ok(None)
@@ -665,6 +743,7 @@ where
             view.set_num_keys(mid);
             view.set_next_leaf(right_idx);
         }
+        write_page_checksum(self.store.page_mut(left_idx));
 
         let right_n = lc - mid;
         let separator = all_keys[mid];
@@ -677,6 +756,7 @@ where
             view.set_num_keys(right_n);
             view.set_next_leaf(old_next);
         }
+        write_page_checksum(self.store.page_mut(right_idx));
 
         {
             let page = self.store.page_mut(root_idx);
@@ -687,6 +767,7 @@ where
             view.children_mut()[1] = right_idx;
             view.set_num_keys(1);
         }
+        write_page_checksum(self.store.page_mut(root_idx));
 
         Ok(())
     }
@@ -712,6 +793,7 @@ where
             view.children_mut()[..mid + 1].copy_from_slice(&all_children[..mid + 1]);
             view.set_num_keys(mid);
         }
+        write_page_checksum(self.store.page_mut(left_idx));
 
         let separator = all_keys[mid];
         let right_n = ic - mid - 1;
@@ -723,6 +805,7 @@ where
             view.children_mut()[..right_n + 1].copy_from_slice(&all_children[mid + 1..]);
             view.set_num_keys(right_n);
         }
+        write_page_checksum(self.store.page_mut(right_idx));
 
         {
             let page = self.store.page_mut(root_idx);
@@ -733,6 +816,7 @@ where
             view.children_mut()[1] = right_idx;
             view.set_num_keys(1);
         }
+        write_page_checksum(self.store.page_mut(root_idx));
 
         Ok(())
     }
@@ -779,6 +863,7 @@ where
             view.set_num_keys(right_n);
             view.set_next_leaf(old_next);
         }
+        write_page_checksum(self.store.page_mut(right_idx));
 
         {
             let page = self.store.page_mut(leaf_idx);
@@ -786,6 +871,7 @@ where
             view.set_num_keys(mid);
             view.set_next_leaf(right_idx);
         }
+        write_page_checksum(self.store.page_mut(leaf_idx));
 
         Ok((separator, right_idx))
     }
@@ -812,12 +898,14 @@ where
             view.children_mut()[..right_n + 1].copy_from_slice(&all_children[mid + 1..]);
             view.set_num_keys(right_n);
         }
+        write_page_checksum(self.store.page_mut(right_idx));
 
         {
             let page = self.store.page_mut(node_idx);
             let mut view = InternalViewMut::<K>::new(page, &self.layout);
             view.set_num_keys(mid);
         }
+        write_page_checksum(self.store.page_mut(node_idx));
 
         Ok((separator, right_idx))
     }
@@ -833,23 +921,26 @@ where
         key: K,
         right_child: u64,
     ) {
-        let page = self.store.page_mut(node_idx);
-        let mut view = InternalViewMut::<K>::new(page, &self.layout);
-        let n = view.num_keys();
-        debug_assert!(n < self.layout.internal_capacity);
-
         {
-            let keys = view.keys_mut();
-            keys.copy_within(slot..n, slot + 1);
-            keys[slot] = key;
-        }
-        {
-            let children = view.children_mut();
-            children.copy_within(slot + 1..n + 1, slot + 2);
-            children[slot + 1] = right_child;
-        }
+            let page = self.store.page_mut(node_idx);
+            let mut view = InternalViewMut::<K>::new(page, &self.layout);
+            let n = view.num_keys();
+            debug_assert!(n < self.layout.internal_capacity);
 
-        view.set_num_keys(n + 1);
+            {
+                let keys = view.keys_mut();
+                keys.copy_within(slot..n, slot + 1);
+                keys[slot] = key;
+            }
+            {
+                let children = view.children_mut();
+                children.copy_within(slot + 1..n + 1, slot + 2);
+                children[slot + 1] = right_child;
+            }
+
+            view.set_num_keys(n + 1);
+        }
+        write_page_checksum(self.store.page_mut(node_idx));
     }
 
     // -----------------------------------------------------------------------
@@ -857,6 +948,7 @@ where
     // -----------------------------------------------------------------------
 
     fn leaf_insert(&mut self, leaf_idx: u64, key: K, value: V) -> Result<Option<V>> {
+        self.verify_page(leaf_idx)?;
         let (slot, exists) = {
             let page = self.store.page(leaf_idx);
             let view = LeafView::<K, V>::new(page, &self.layout);
@@ -871,27 +963,33 @@ where
                 let page = self.store.page(leaf_idx);
                 LeafView::<K, V>::new(page, &self.layout).values()[slot]
             };
-            let page = self.store.page_mut(leaf_idx);
-            LeafViewMut::<K, V>::new(page, &self.layout).values_mut()[slot] = value;
+            {
+                let page = self.store.page_mut(leaf_idx);
+                LeafViewMut::<K, V>::new(page, &self.layout).values_mut()[slot] = value;
+            }
+            write_page_checksum(self.store.page_mut(leaf_idx));
             return Ok(Some(old));
         }
 
-        let page = self.store.page_mut(leaf_idx);
-        let mut view = LeafViewMut::<K, V>::new(page, &self.layout);
-        let n = view.num_keys();
-        debug_assert!(n < self.layout.leaf_capacity, "leaf overflowed");
+        {
+            let page = self.store.page_mut(leaf_idx);
+            let mut view = LeafViewMut::<K, V>::new(page, &self.layout);
+            let n = view.num_keys();
+            debug_assert!(n < self.layout.leaf_capacity, "leaf overflowed");
 
-        {
-            let keys = view.keys_mut();
-            keys.copy_within(slot..n, slot + 1);
-            keys[slot] = key;
+            {
+                let keys = view.keys_mut();
+                keys.copy_within(slot..n, slot + 1);
+                keys[slot] = key;
+            }
+            {
+                let vals = view.values_mut();
+                vals.copy_within(slot..n, slot + 1);
+                vals[slot] = value;
+            }
+            view.set_num_keys(n + 1);
         }
-        {
-            let vals = view.values_mut();
-            vals.copy_within(slot..n, slot + 1);
-            vals[slot] = value;
-        }
-        view.set_num_keys(n + 1);
+        write_page_checksum(self.store.page_mut(leaf_idx));
 
         self.store.header_mut().num_entries += 1;
         Ok(None)
@@ -938,6 +1036,7 @@ where
 
     /// Removes `key` from the leaf at `leaf_idx`.
     fn leaf_delete(&mut self, leaf_idx: u64, key: &K) -> Result<Option<V>> {
+        self.verify_page(leaf_idx)?;
         let (slot, found) = {
             let page = self.store.page(leaf_idx);
             let view = LeafView::<K, V>::new(page, &self.layout);
@@ -955,18 +1054,21 @@ where
             LeafView::<K, V>::new(page, &self.layout).values()[slot]
         };
 
-        let page = self.store.page_mut(leaf_idx);
-        let mut view = LeafViewMut::<K, V>::new(page, &self.layout);
-        let n = view.num_keys();
         {
-            let keys = view.keys_mut();
-            keys.copy_within(slot + 1..n, slot);
+            let page = self.store.page_mut(leaf_idx);
+            let mut view = LeafViewMut::<K, V>::new(page, &self.layout);
+            let n = view.num_keys();
+            {
+                let keys = view.keys_mut();
+                keys.copy_within(slot + 1..n, slot);
+            }
+            {
+                let vals = view.values_mut();
+                vals.copy_within(slot + 1..n, slot);
+            }
+            view.set_num_keys(n - 1);
         }
-        {
-            let vals = view.values_mut();
-            vals.copy_within(slot + 1..n, slot);
-        }
-        view.set_num_keys(n - 1);
+        write_page_checksum(self.store.page_mut(leaf_idx));
 
         Ok(Some(old_val))
     }
@@ -974,7 +1076,7 @@ where
     /// Recurses into the subtree at `node_idx` to delete `key`, then
     /// rebalances if the child that was descended into became underfull.
     fn internal_delete(&mut self, node_idx: u64, key: &K) -> Result<Option<V>> {
-        let (child_slot, child_idx) = self.internal_child_slot(node_idx, key);
+        let (child_slot, child_idx) = self.internal_child_slot(node_idx, key)?;
 
         let result = match self.node_kind(child_idx) {
             NODE_KIND_LEAF => self.leaf_delete(child_idx, key)?,
@@ -985,7 +1087,7 @@ where
             let child_n = self.num_keys_of(child_idx);
             let min = self.min_keys_of(child_idx);
             if child_n < min {
-                self.fix_underfull_child(node_idx, child_slot);
+                self.fix_underfull_child(node_idx, child_slot)?;
             }
         }
 
@@ -996,7 +1098,7 @@ where
     ///
     /// Tries to steal from the left sibling, then the right sibling.
     /// If neither can spare a key, merges the child with a sibling.
-    fn fix_underfull_child(&mut self, parent_idx: u64, child_slot: usize) {
+    fn fix_underfull_child(&mut self, parent_idx: u64, child_slot: usize) -> Result<()> {
         let parent_n = self.num_keys_of(parent_idx);
 
         let child_idx = {
@@ -1019,7 +1121,7 @@ where
                 } else {
                     self.borrow_from_left_internal(parent_idx, sep_slot, left_idx, child_idx);
                 }
-                return;
+                return Ok(());
             }
         }
 
@@ -1036,7 +1138,7 @@ where
                 } else {
                     self.borrow_from_right_internal(parent_idx, sep_slot, child_idx, right_idx);
                 }
-                return;
+                return Ok(());
             }
         }
 
@@ -1066,6 +1168,7 @@ where
                 self.merge_internal_nodes(parent_idx, sep_slot, child_idx, right_idx);
             }
         }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1101,6 +1204,7 @@ where
             vals[0] = moved_val;
             view.set_num_keys(n + 1);
         }
+        write_page_checksum(self.store.page_mut(child_idx));
 
         // Shrink left.
         {
@@ -1109,6 +1213,7 @@ where
             let n = view.num_keys();
             view.set_num_keys(n - 1);
         }
+        write_page_checksum(self.store.page_mut(left_idx));
 
         // New separator = moved_key (the new minimum of child).
         {
@@ -1116,6 +1221,7 @@ where
             let mut view = InternalViewMut::<K>::new(page, &self.layout);
             view.keys_mut()[sep_slot] = moved_key;
         }
+        write_page_checksum(self.store.page_mut(parent_idx));
     }
 
     /// Leaf: move `right`'s first key/value to the end of `child`.
@@ -1144,6 +1250,7 @@ where
             view.values_mut()[n] = moved_val;
             view.set_num_keys(n + 1);
         }
+        write_page_checksum(self.store.page_mut(child_idx));
 
         // Remove first entry from right (shift left).
         {
@@ -1156,6 +1263,7 @@ where
             vals.copy_within(1..n, 0);
             view.set_num_keys(n - 1);
         }
+        write_page_checksum(self.store.page_mut(right_idx));
 
         // New separator = new minimum of right.
         {
@@ -1163,6 +1271,7 @@ where
             let mut view = InternalViewMut::<K>::new(page, &self.layout);
             view.keys_mut()[sep_slot] = new_sep;
         }
+        write_page_checksum(self.store.page_mut(parent_idx));
     }
 
     /// Internal: pull down parent separator into front of `child`,
@@ -1198,6 +1307,7 @@ where
             children[0] = left_last_child;
             view.set_num_keys(n + 1);
         }
+        write_page_checksum(self.store.page_mut(child_idx));
 
         // Shrink left (drop its last key and last child pointer).
         {
@@ -1206,6 +1316,7 @@ where
             let n = view.num_keys();
             view.set_num_keys(n - 1);
         }
+        write_page_checksum(self.store.page_mut(left_idx));
 
         // Push left_last_key up to parent.
         {
@@ -1213,6 +1324,7 @@ where
             let mut view = InternalViewMut::<K>::new(page, &self.layout);
             view.keys_mut()[sep_slot] = left_last_key;
         }
+        write_page_checksum(self.store.page_mut(parent_idx));
     }
 
     /// Internal: pull down parent separator into back of `child`,
@@ -1243,6 +1355,7 @@ where
             view.children_mut()[n + 1] = right_first_child;
             view.set_num_keys(n + 1);
         }
+        write_page_checksum(self.store.page_mut(child_idx));
 
         // Shrink right (shift keys and children left by 1).
         {
@@ -1255,6 +1368,7 @@ where
             children.copy_within(1..n + 1, 0);
             view.set_num_keys(n - 1);
         }
+        write_page_checksum(self.store.page_mut(right_idx));
 
         // Push right_first_key up to parent.
         {
@@ -1262,6 +1376,7 @@ where
             let mut view = InternalViewMut::<K>::new(page, &self.layout);
             view.keys_mut()[sep_slot] = right_first_key;
         }
+        write_page_checksum(self.store.page_mut(parent_idx));
     }
 
     // -----------------------------------------------------------------------
@@ -1295,6 +1410,7 @@ where
             view.set_num_keys(ln + rn);
             view.set_next_leaf(right_next);
         }
+        write_page_checksum(self.store.page_mut(left_idx));
 
         self.remove_from_internal(parent_idx, sep_slot);
         self.store.free_page(right_idx);
@@ -1333,6 +1449,7 @@ where
             children[ln + 1..ln + 1 + rn + 1].copy_from_slice(&right_children);
             view.set_num_keys(ln + 1 + rn);
         }
+        write_page_checksum(self.store.page_mut(left_idx));
 
         self.remove_from_internal(parent_idx, sep_slot);
         self.store.free_page(right_idx);
@@ -1341,18 +1458,21 @@ where
     /// Removes the key at `sep_slot` and the child pointer at `sep_slot + 1`
     /// from the internal node at `node_idx`, shifting remaining entries left.
     fn remove_from_internal(&mut self, node_idx: u64, sep_slot: usize) {
-        let page = self.store.page_mut(node_idx);
-        let mut view = InternalViewMut::<K>::new(page, &self.layout);
-        let n = view.num_keys();
         {
-            let keys = view.keys_mut();
-            keys.copy_within(sep_slot + 1..n, sep_slot);
+            let page = self.store.page_mut(node_idx);
+            let mut view = InternalViewMut::<K>::new(page, &self.layout);
+            let n = view.num_keys();
+            {
+                let keys = view.keys_mut();
+                keys.copy_within(sep_slot + 1..n, sep_slot);
+            }
+            {
+                let children = view.children_mut();
+                children.copy_within(sep_slot + 2..n + 1, sep_slot + 1);
+            }
+            view.set_num_keys(n - 1);
         }
-        {
-            let children = view.children_mut();
-            children.copy_within(sep_slot + 2..n + 1, sep_slot + 1);
-        }
-        view.set_num_keys(n - 1);
+        write_page_checksum(self.store.page_mut(node_idx));
     }
 
     // -----------------------------------------------------------------------
@@ -1460,7 +1580,7 @@ impl<'a, K: Ord + Pod, V: Pod> MmapBTreeRangeIter<'a, K, V> {
     fn new<R: RangeBounds<K>>(
         guard: RwLockReadGuard<'a, MmapBTreeInner<K, V>>,
         range: R,
-    ) -> Self {
+    ) -> Result<Self> {
         // Copy the end bound (K: Copy via Pod).
         let end_bound: Bound<K> = match range.end_bound() {
             Bound::Included(k) => Bound::Included(*k),
@@ -1469,12 +1589,12 @@ impl<'a, K: Ord + Pod, V: Pod> MmapBTreeRangeIter<'a, K, V> {
         };
 
         let (current_page, current_slot) = match range.start_bound() {
-            Bound::Included(k) => guard.lower_bound(k),
-            Bound::Excluded(k) => guard.lower_bound_exclusive(k),
+            Bound::Included(k) => guard.lower_bound(k)?,
+            Bound::Excluded(k) => guard.lower_bound_exclusive(k)?,
             Bound::Unbounded => guard.first_leaf(),
         };
 
-        Self { guard, current_page, current_slot, end_bound }
+        Ok(Self { guard, current_page, current_slot, end_bound })
     }
 }
 
@@ -2837,5 +2957,270 @@ mod tests {
         let tree_items: Vec<_> = tree.iter().unwrap().collect();
         let ref_items: Vec<_> = reference.iter().map(|(&k, &v)| (k, v)).collect();
         assert_eq!(tree_items, ref_items);
+    }
+
+    // ── Recovery / crash safety ──────────────────────────────────────────────
+
+    /// Plant a WAL for insert on a clean (empty) tree, re-open → key recovered.
+    #[test]
+    fn recovery_insert_from_wal_on_clean_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        // Create an empty tree and close it.
+        {
+            let _tree = MmapBTreeBuilder::<i32, u64>::new()
+                .path(&path)
+                .build()
+                .unwrap();
+        }
+        // Plant a WAL as if we crashed after fsync but before any mmap write.
+        let key: i32 = 42;
+        let val: u64 = 100;
+        wal::write_and_sync(
+            &path,
+            wal::WAL_OP_INSERT,
+            bytemuck::bytes_of(&key),
+            bytemuck::bytes_of(&val),
+        )
+        .unwrap();
+        // Re-open: WAL recovery inserts the key.
+        let tree = MmapBTreeBuilder::<i32, u64>::new()
+            .path(&path)
+            .build()
+            .unwrap();
+        assert_eq!(tree.get_value(&key).unwrap(), Some(val));
+        // WAL must be cleaned up after recovery.
+        assert!(!wal::wal_path(&path).exists());
+    }
+
+    /// Plant a WAL for remove after a successful insert, re-open → key absent.
+    #[test]
+    fn recovery_remove_from_wal_on_clean_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let tree = MmapBTreeBuilder::<i32, u64>::new()
+                .path(&path)
+                .build()
+                .unwrap();
+            tree.insert(42_i32, 100_u64).unwrap();
+        }
+        // Plant a WAL for remove(42) as if we crashed before the mmap write.
+        let key: i32 = 42;
+        let zeros = vec![0u8; std::mem::size_of::<u64>()];
+        wal::write_and_sync(&path, wal::WAL_OP_REMOVE, bytemuck::bytes_of(&key), &zeros)
+            .unwrap();
+        // Re-open: WAL recovery removes the key.
+        let tree = MmapBTreeBuilder::<i32, u64>::new()
+            .path(&path)
+            .build()
+            .unwrap();
+        assert_eq!(tree.get_value(&key).unwrap(), None);
+        assert!(!wal::wal_path(&path).exists());
+    }
+
+    /// Re-applying an already-completed insert WAL is idempotent.
+    ///
+    /// Scenario: insert completed and was flushed, but the WAL was not yet
+    /// deleted when the process died.  On replay the insert overwrites the
+    /// same key with the same value → still correct.
+    #[test]
+    fn recovery_insert_already_done_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let tree = MmapBTreeBuilder::<i32, u64>::new()
+                .path(&path)
+                .build()
+                .unwrap();
+            tree.insert(7_i32, 888_u64).unwrap();
+        }
+        // Plant the same WAL again (simulating: WAL was not deleted before crash).
+        let key: i32 = 7;
+        let val: u64 = 888;
+        wal::write_and_sync(
+            &path,
+            wal::WAL_OP_INSERT,
+            bytemuck::bytes_of(&key),
+            bytemuck::bytes_of(&val),
+        )
+        .unwrap();
+        let tree = MmapBTreeBuilder::<i32, u64>::new()
+            .path(&path)
+            .build()
+            .unwrap();
+        assert_eq!(tree.get_value(&key).unwrap(), Some(val));
+        assert!(!wal::wal_path(&path).exists());
+    }
+
+    /// Re-applying a remove WAL for a key that was already absent is a no-op.
+    #[test]
+    fn recovery_remove_key_absent_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let _tree = MmapBTreeBuilder::<i32, u64>::new()
+                .path(&path)
+                .build()
+                .unwrap();
+        }
+        // Plant a remove WAL for key 99, which was never inserted.
+        let key: i32 = 99;
+        let zeros = vec![0u8; std::mem::size_of::<u64>()];
+        wal::write_and_sync(&path, wal::WAL_OP_REMOVE, bytemuck::bytes_of(&key), &zeros)
+            .unwrap();
+        // Re-open: remove of absent key is a no-op, no error.
+        let tree = MmapBTreeBuilder::<i32, u64>::new()
+            .path(&path)
+            .build()
+            .unwrap();
+        assert_eq!(tree.get_value(&key).unwrap(), None);
+        assert!(!wal::wal_path(&path).exists());
+    }
+
+    /// A truncated / garbage WAL is silently ignored; the tree opens normally.
+    #[test]
+    fn recovery_corrupt_wal_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let _tree = MmapBTreeBuilder::<i32, u64>::new()
+                .path(&path)
+                .build()
+                .unwrap();
+        }
+        // Write 3 bytes of garbage — shorter than WAL_HEADER_LEN + any K/V.
+        std::fs::write(wal::wal_path(&path), b"XXX").unwrap();
+        // Must open without error and behave normally.
+        let tree = MmapBTreeBuilder::<i32, u64>::new()
+            .path(&path)
+            .build()
+            .unwrap();
+        tree.insert(1_i32, 2_u64).unwrap();
+        assert_eq!(tree.get_value(&1_i32).unwrap(), Some(2_u64));
+    }
+
+    /// After a successful insert or remove, the WAL file must be absent.
+    #[test]
+    fn recovery_wal_deleted_after_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let tree = MmapBTreeBuilder::<i32, u64>::new()
+            .path(&path)
+            .build()
+            .unwrap();
+        tree.insert(1_i32, 2_u64).unwrap();
+        assert!(
+            !wal::wal_path(&path).exists(),
+            "WAL must be deleted after insert"
+        );
+        tree.remove(&1_i32).unwrap();
+        assert!(
+            !wal::wal_path(&path).exists(),
+            "WAL must be deleted after remove"
+        );
+    }
+
+    /// Opening a version-1 file triggers the one-time migration: checksums are
+    /// written to all live node pages and the stored version is bumped to 2.
+    /// All entries remain readable and new operations succeed.
+    #[test]
+    fn recovery_version1_upgrade() {
+        use crate::storage::{FileHeader, MAGIC, NODE_KIND_INTERNAL, NODE_KIND_LEAF, PAGE_SIZE};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+
+        // 1. Create a v2 tree with some entries.
+        {
+            let tree = MmapBTreeBuilder::<i32, i32>::new()
+                .path(&path)
+                .build()
+                .unwrap();
+            for i in 0..20_i32 {
+                tree.insert(i, i * 10).unwrap();
+            }
+        }
+
+        // 2. Patch the file: downgrade version to 1 and zero all page checksums.
+        {
+            let mut data = std::fs::read(&path).unwrap();
+            // `version` is at bytes 8..10 of FileHeader (native endian u16).
+            let v1 = 1u16.to_ne_bytes();
+            data[8] = v1[0];
+            data[9] = v1[1];
+            // Zero checksum field (bytes 4..8) in every live node page.
+            let num_pages = data.len() / PAGE_SIZE;
+            for p in 1..num_pages {
+                let base = p * PAGE_SIZE;
+                let kind = data[base];
+                if kind == NODE_KIND_LEAF || kind == NODE_KIND_INTERNAL {
+                    data[base + 4] = 0;
+                    data[base + 5] = 0;
+                    data[base + 6] = 0;
+                    data[base + 7] = 0;
+                }
+            }
+            std::fs::write(&path, &data).unwrap();
+        }
+
+        // 3. Re-open: the v1→v2 migration runs automatically.
+        let tree = MmapBTreeBuilder::<i32, i32>::new()
+            .path(&path)
+            .build()
+            .unwrap();
+
+        // 4. All previously inserted entries must still be readable.
+        for i in 0..20_i32 {
+            assert_eq!(tree.get_value(&i).unwrap(), Some(i * 10), "key {i}");
+        }
+
+        // 5. New operations must work (checksums are now written on mutations).
+        tree.insert(100_i32, 999_i32).unwrap();
+        assert_eq!(tree.get_value(&100_i32).unwrap(), Some(999_i32));
+        tree.remove(&0_i32).unwrap();
+        assert_eq!(tree.get_value(&0_i32).unwrap(), None);
+    }
+
+    /// Flipping a byte in a node page on disk is detected as corruption on read.
+    #[test]
+    fn recovery_checksum_detects_page_flip() {
+        use crate::storage::PAGE_SIZE;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+
+        // Insert enough entries to populate at least one leaf page.
+        {
+            let tree = MmapBTreeBuilder::<i32, i32>::new()
+                .path(&path)
+                .build()
+                .unwrap();
+            for i in 0..50_i32 {
+                tree.insert(i, i).unwrap();
+            }
+        }
+
+        // Flip a byte in page 1 (first non-header page) past the NodeHeader,
+        // so it is covered by the checksum but isn't the checksum field itself.
+        {
+            let mut data = std::fs::read(&path).unwrap();
+            let target = PAGE_SIZE + 20; // byte 20 within page 1 (in key area)
+            data[target] ^= 0xFF;
+            std::fs::write(&path, &data).unwrap();
+        }
+
+        // Re-open: no WAL, so no recovery attempt; the page is simply corrupt.
+        let tree = MmapBTreeBuilder::<i32, i32>::new()
+            .path(&path)
+            .build()
+            .unwrap();
+
+        // Any read that traverses page 1 must surface a Corruption error.
+        match tree.get_value(&0_i32) {
+            Err(BTreeError::Corruption(_)) => {} // expected
+            Ok(v) => panic!("expected Corruption, got Ok({v:?})"),
+            Err(e) => panic!("expected Corruption, got {e:?}"),
+        }
     }
 }

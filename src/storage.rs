@@ -36,7 +36,12 @@ use crate::tree::{BTreeError, Result};
 pub const MAGIC: [u8; 8] = *b"MMBPTREE";
 
 /// Current on-disk format version.
-pub const VERSION: u16 = 1;
+/// Version 2 introduced per-page CRC32 checksums stored in `NodeHeader.checksum`.
+pub const VERSION: u16 = 2;
+
+/// Byte offset of the checksum field within a node page.
+/// Corresponds to `NodeHeader.checksum` at offset 4 inside `NodeHeader`.
+pub const CHECKSUM_OFFSET: usize = 4;
 
 /// Sentinel page index meaning "no page" (null pointer equivalent).
 /// Page 0 is the file header, so it is never a valid node page.
@@ -92,8 +97,9 @@ pub struct FileHeader {
     pub num_pages: u64,
     /// Total number of key-value pairs stored in the tree.
     pub num_entries: u64,
-    /// Reserved for future use (checksum, flags, etc.).
-    pub _pad1: u64,
+    /// Lower 32 bits: CRC32 of the first 56 bytes of this header.
+    /// Upper 32 bits: reserved (zero).
+    pub header_checksum: u64,
 }
 
 // Compile-time size assertion.
@@ -111,7 +117,10 @@ pub struct NodeHeader {
     pub _pad: u8,
     /// Number of live keys currently stored in this node.
     pub num_keys: u16,
-    pub _pad2: u32,
+    /// CRC32 checksum of the page, excluding bytes [`CHECKSUM_OFFSET`]..`CHECKSUM_OFFSET+4`.
+    /// Written by [`write_page_checksum`] after all other page content is set.
+    /// Zero in version-1 files; valid in version-2 files.
+    pub checksum: u32,
     /// **Leaf**: page index of the next leaf sibling ([`NULL_PAGE`] = last leaf).
     /// **Internal**: always [`NULL_PAGE`].
     /// **Freed**: repurposed as `next_free` pointer by [`FreePageHeader`].
@@ -281,6 +290,8 @@ pub struct MmapStore {
     /// that changes the page count so that page-index arithmetic never needs
     /// a `from_bytes` round-trip through the header.
     pub total_pages: u64,
+    /// Whether per-page CRC32 checksums are active (true for version-2 files).
+    pub checksums_enabled: bool,
 }
 
 impl std::fmt::Debug for MmapStore {
@@ -339,10 +350,11 @@ impl MmapStore {
         if hdr.magic != MAGIC {
             return Err(BTreeError::Corruption("bad magic bytes".into()));
         }
-        if hdr.version != VERSION {
+        let version = hdr.version;
+        if version != 1 && version != VERSION {
             return Err(BTreeError::Corruption(format!(
                 "unsupported version {} (expected {})",
-                hdr.version, VERSION
+                version, VERSION
             )));
         }
         if hdr.page_size as usize != PAGE_SIZE {
@@ -365,7 +377,25 @@ impl MmapStore {
         }
 
         let total_pages = hdr.num_pages;
-        Ok(Self { file, mmap, page_size: PAGE_SIZE, total_pages })
+
+        let mut store = Self { file, mmap, page_size: PAGE_SIZE, total_pages, checksums_enabled: false };
+
+        if version == 1 {
+            // One-time migration: write checksums to all live node pages and
+            // bump the on-disk version to 2.
+            for i in 1..total_pages {
+                let kind = store.mmap[i as usize * PAGE_SIZE];
+                if kind == NODE_KIND_INTERNAL || kind == NODE_KIND_LEAF {
+                    let page = store.page_mut(i);
+                    write_page_checksum(page);
+                }
+            }
+            store.header_mut().version = VERSION;
+            store.mmap.flush().map_err(BTreeError::from)?;
+        }
+
+        store.checksums_enabled = true;
+        Ok(store)
     }
 
     fn create_new(file: File, key_size: usize, value_size: usize) -> Result<Self> {
@@ -388,12 +418,12 @@ impl MmapStore {
             free_list_head: NULL_PAGE,
             num_pages: 1,
             num_entries: 0,
-            _pad1: 0,
+            header_checksum: 0,
         };
 
         mmap.flush().map_err(BTreeError::from)?;
 
-        Ok(Self { file, mmap, page_size: PAGE_SIZE, total_pages: 1 })
+        Ok(Self { file, mmap, page_size: PAGE_SIZE, total_pages: 1, checksums_enabled: true })
     }
 
     // -----------------------------------------------------------------------
@@ -573,6 +603,42 @@ impl MmapStore {
 }
 
 // ---------------------------------------------------------------------------
+// Page checksum helpers
+// ---------------------------------------------------------------------------
+
+/// Computes the CRC32 of a node page, excluding the 4-byte checksum field at
+/// bytes [`CHECKSUM_OFFSET`]..[`CHECKSUM_OFFSET`]+4.
+///
+/// The covered region is `page[0..CHECKSUM_OFFSET]` concatenated with
+/// `page[CHECKSUM_OFFSET+4..PAGE_SIZE]` — i.e. `PAGE_SIZE - 4` bytes total.
+pub(crate) fn page_checksum(page: &[u8]) -> u32 {
+    let mut h = crc32fast::Hasher::new();
+    h.update(&page[..CHECKSUM_OFFSET]);
+    h.update(&page[CHECKSUM_OFFSET + 4..]);
+    h.finalize()
+}
+
+/// Writes the CRC32 checksum into `page[CHECKSUM_OFFSET..CHECKSUM_OFFSET+4]`.
+///
+/// Must be called **after** all other content has been written to the page.
+pub(crate) fn write_page_checksum(page: &mut [u8]) {
+    let cs = page_checksum(page);
+    page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&cs.to_ne_bytes());
+}
+
+/// Returns `true` if the stored checksum in the page matches the computed one.
+///
+/// An all-zero page (freshly allocated, not yet initialised) will almost
+/// certainly return `false` here, which correctly prevents treating an
+/// uninitialised page as a valid node.
+pub(crate) fn verify_page_checksum(page: &[u8]) -> bool {
+    let stored = u32::from_ne_bytes(
+        page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].try_into().unwrap(),
+    );
+    stored == page_checksum(page)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -645,12 +711,45 @@ mod tests {
             let store = MmapStore::open(&path, 4, 4).unwrap();
             assert_eq!(store.total_pages, 1);
             assert_eq!(store.header().root_page, NULL_PAGE);
+            assert!(store.checksums_enabled);
         }
 
         // Re-open the existing file.
         let store = MmapStore::open(&path, 4, 4).unwrap();
         assert_eq!(store.header().magic, MAGIC);
         assert_eq!(store.header().version, VERSION);
+        assert!(store.checksums_enabled);
+    }
+
+    // ── Checksum helpers ─────────────────────────────────────────────────────
+
+    #[test]
+    fn checksum_round_trip() {
+        let mut page = vec![0u8; PAGE_SIZE];
+        // Write some non-trivial content.
+        page[0] = NODE_KIND_LEAF;
+        page[2] = 3; // num_keys low byte
+        page[16] = 42; // first key byte
+        write_page_checksum(&mut page);
+        assert!(verify_page_checksum(&page));
+    }
+
+    #[test]
+    fn checksum_detects_bit_flip() {
+        let mut page = vec![0u8; PAGE_SIZE];
+        page[0] = NODE_KIND_INTERNAL;
+        write_page_checksum(&mut page);
+        assert!(verify_page_checksum(&page));
+        page[100] ^= 0xFF; // corrupt a data byte
+        assert!(!verify_page_checksum(&page));
+    }
+
+    #[test]
+    fn zero_page_fails_checksum() {
+        // An all-zero page has stored checksum 0, but the CRC32 of all-zero
+        // content (excluding the checksum field) is non-zero.
+        let page = vec![0u8; PAGE_SIZE];
+        assert!(!verify_page_checksum(&page));
     }
 
     #[test]
