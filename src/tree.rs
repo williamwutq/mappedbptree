@@ -3174,7 +3174,7 @@ mod tests {
     /// All entries remain readable and new operations succeed.
     #[test]
     fn recovery_version1_upgrade() {
-        use crate::storage::{FileHeader, MAGIC, NODE_KIND_INTERNAL, NODE_KIND_LEAF, PAGE_SIZE};
+        use crate::storage::{NODE_KIND_INTERNAL, NODE_KIND_LEAF, PAGE_SIZE};
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.db");
