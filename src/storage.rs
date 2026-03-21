@@ -615,6 +615,53 @@ impl MmapStore {
     }
 
     // -----------------------------------------------------------------------
+    // Truncation
+    // -----------------------------------------------------------------------
+
+    /// Resets the tree to an empty state and truncates the file to a single
+    /// header page, reclaiming all disk space used by node pages.
+    ///
+    /// The operation is committed in two steps:
+    ///
+    /// 1. The header is updated in-memory (`root_page`, `free_list_head`,
+    ///    `num_pages`, `num_entries` all set to their empty-tree values) and
+    ///    then flushed to disk with `msync`.  After this flush the tree is
+    ///    logically empty and durable, regardless of what follows.
+    /// 2. The file is truncated to `PAGE_SIZE` bytes via `ftruncate` and the
+    ///    mmap is remapped.  This step only reclaims disk space; correctness
+    ///    is already committed by step 1.
+    ///
+    /// If the process crashes between steps 1 and 2 the file retains the old
+    /// node pages as dead bytes, but the header describes a valid empty tree,
+    /// so the next open succeeds and the tree behaves correctly.
+    pub fn truncate_to_header(&mut self) -> Result<()> {
+        // Step 1: overwrite the header with empty-tree state and flush.
+        {
+            let hdr = self.header_mut();
+            hdr.root_page = NULL_PAGE;
+            hdr.free_list_head = NULL_PAGE;
+            hdr.num_pages = 1;
+            hdr.num_entries = 0;
+        }
+        self.mmap.flush().map_err(BTreeError::from)?;
+
+        // Step 2: shrink the file and remap.  Same swap-drop pattern as grow().
+        let old_mmap = std::mem::replace(
+            &mut self.mmap,
+            MmapMut::map_anon(1).map_err(BTreeError::from)?,
+        );
+        drop(old_mmap);
+
+        self.file.set_len(PAGE_SIZE as u64).map_err(BTreeError::from)?;
+
+        // SAFETY: file was just truncated to PAGE_SIZE; we own it exclusively.
+        self.mmap = unsafe { MmapMut::map_mut(&self.file) }.map_err(BTreeError::from)?;
+        self.total_pages = 1;
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // Persistence
     // -----------------------------------------------------------------------
 

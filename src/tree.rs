@@ -1553,39 +1553,9 @@ where
         write_page_checksum(self.store.page_mut(node_idx));
     }
 
-    // -----------------------------------------------------------------------
-    // clear_impl
-    // -----------------------------------------------------------------------
-
+    /// Free is just truncate the store to the header page, which is empty except for the header.
     fn clear_impl(&mut self) -> Result<()> {
-        let root = self.store.header().root_page;
-        if root != NULL_PAGE {
-            self.free_subtree(root);
-        }
-        {
-            let hdr = self.store.header_mut();
-            hdr.root_page = NULL_PAGE;
-            hdr.num_entries = 0;
-        }
-        Ok(())
-    }
-
-    fn free_subtree(&mut self, page_idx: u64) {
-        match self.node_kind(page_idx) {
-            NODE_KIND_LEAF => {
-                self.store.free_page(page_idx);
-            }
-            _ => {
-                let children: Vec<u64> = {
-                    let page = self.store.page(page_idx);
-                    InternalView::<K>::new(page, &self.layout).children().to_vec()
-                };
-                for child in children {
-                    self.free_subtree(child);
-                }
-                self.store.free_page(page_idx);
-            }
-        }
+        self.store.truncate_to_header()
     }
 }
 
