@@ -46,9 +46,8 @@ use bytemuck::Pod;
 
 use crate::node::{InternalView, InternalViewMut, LeafView, LeafViewMut};
 use crate::storage::{
-    MmapStore, NodeHeader, NodeLayout, NODE_HEADER_SIZE, NODE_KIND_LEAF,
-    NULL_PAGE, PAGE_SIZE,
-    write_page_checksum, verify_page_checksum,
+    MmapStore, NODE_HEADER_SIZE, NODE_KIND_LEAF, NULL_PAGE, NodeHeader, NodeLayout, PAGE_SIZE,
+    verify_page_checksum, write_page_checksum,
 };
 use crate::wal;
 
@@ -127,7 +126,10 @@ where
 {
     /// Creates a new builder with default settings.
     pub fn new() -> Self {
-        Self { path: None, _phantom: PhantomData }
+        Self {
+            path: None,
+            _phantom: PhantomData,
+        }
     }
 
     /// Sets the file path for the B+tree storage.
@@ -153,9 +155,9 @@ where
     ///   incompatible key/value sizes.
     /// - [`BTreeError::Other`] — [`path`](Self::path) was not called.
     pub fn build(self) -> Result<MmapBTree<K, V>> {
-        let path = self.path.ok_or_else(|| {
-            BTreeError::Other("Path must be set via .path()".to_string())
-        })?;
+        let path = self
+            .path
+            .ok_or_else(|| BTreeError::Other("Path must be set via .path()".to_string()))?;
         MmapBTree::open(path)
     }
 }
@@ -191,14 +193,8 @@ pub struct MmapBTreeValueRef<'a, K: Ord + Pod, V: Pod> {
 // SAFETY: `ptr` points into the mmap, which is stable while the read guard
 // is held (writes need an exclusive lock to remap).  `V: Pod` ensures the
 // bytes at `ptr` form a valid `V`.
-unsafe impl<K: Ord + Pod + Send + Sync, V: Pod + Send + Sync> Send
-    for MmapBTreeValueRef<'_, K, V>
-{
-}
-unsafe impl<K: Ord + Pod + Send + Sync, V: Pod + Send + Sync> Sync
-    for MmapBTreeValueRef<'_, K, V>
-{
-}
+unsafe impl<K: Ord + Pod + Send + Sync, V: Pod + Send + Sync> Send for MmapBTreeValueRef<'_, K, V> {}
+unsafe impl<K: Ord + Pod + Send + Sync, V: Pod + Send + Sync> Sync for MmapBTreeValueRef<'_, K, V> {}
 
 impl<K: Ord + Pod, V: Pod> Deref for MmapBTreeValueRef<'_, K, V> {
     type Target = V;
@@ -313,7 +309,7 @@ where
     V: Pod,
 {
     fn open(path: PathBuf) -> Result<Self> {
-        let key_size   = std::mem::size_of::<K>();
+        let key_size = std::mem::size_of::<K>();
         let value_size = std::mem::size_of::<V>();
 
         let store = MmapStore::open(&path, key_size, value_size)?;
@@ -325,7 +321,11 @@ where
             std::mem::align_of::<V>(),
         );
 
-        let mut inner = MmapBTreeInner { store, layout, _phantom: PhantomData };
+        let mut inner = MmapBTreeInner {
+            store,
+            layout,
+            _phantom: PhantomData,
+        };
 
         // WAL recovery: if a WAL file is present, replay the pending operation.
         // Both insert and remove are idempotent, so replay is always safe.
@@ -354,21 +354,22 @@ where
             wal::delete(&path)?;
         }
 
-        Ok(Self { inner: RwLock::new(inner), db_path: path })
+        Ok(Self {
+            inner: RwLock::new(inner),
+            db_path: path,
+        })
     }
 
-    fn write_guard(
-        &self,
-    ) -> Result<std::sync::RwLockWriteGuard<'_, MmapBTreeInner<K, V>>> {
-        self.inner.write().map_err(|_| {
-            BTreeError::Other("RwLock poisoned on write".to_string())
-        })
+    fn write_guard(&self) -> Result<std::sync::RwLockWriteGuard<'_, MmapBTreeInner<K, V>>> {
+        self.inner
+            .write()
+            .map_err(|_| BTreeError::Other("RwLock poisoned on write".to_string()))
     }
 
     fn read_guard(&self) -> Result<RwLockReadGuard<'_, MmapBTreeInner<K, V>>> {
-        self.inner.read().map_err(|_| {
-            BTreeError::Other("RwLock poisoned on read".to_string())
-        })
+        self.inner
+            .read()
+            .map_err(|_| BTreeError::Other("RwLock poisoned on read".to_string()))
     }
 }
 
@@ -471,10 +472,7 @@ where
     ///
     /// Accepts any `RangeBounds<K>`: `..`, `a..`, `..b`, `a..b`, `a..=b`, etc.
     /// The iterator holds a read lock for its entire lifetime.
-    pub fn range<R: RangeBounds<K>>(
-        &self,
-        range: R,
-    ) -> Result<MmapBTreeRangeIter<'_, K, V>> {
+    pub fn range<R: RangeBounds<K>>(&self, range: R) -> Result<MmapBTreeRangeIter<'_, K, V>> {
         let guard = self.read_guard()?;
         MmapBTreeRangeIter::new(guard, range)
     }
@@ -518,9 +516,7 @@ where
     /// No-op when `checksums_enabled` is false (version-1 files before upgrade).
     #[inline]
     fn verify_page(&self, page_idx: u64) -> Result<()> {
-        if self.store.checksums_enabled
-            && !verify_page_checksum(self.store.page(page_idx))
-        {
+        if self.store.checksums_enabled && !verify_page_checksum(self.store.page(page_idx)) {
             return Err(BTreeError::Corruption(format!(
                 "checksum mismatch on page {page_idx}"
             )));
@@ -546,8 +542,8 @@ where
     #[inline]
     fn min_keys_of(&self, page_idx: u64) -> usize {
         match self.node_kind(page_idx) {
-            NODE_KIND_LEAF => (self.layout.leaf_capacity + 1) / 2,
-            _ => (self.layout.internal_capacity + 1) / 2,
+            NODE_KIND_LEAF => self.layout.leaf_capacity.div_ceil(2),
+            _ => self.layout.internal_capacity.div_ceil(2),
         }
     }
 
@@ -806,7 +802,11 @@ where
         let (all_keys, all_values, old_next) = {
             let page = self.store.page(root_idx);
             let view = LeafView::<K, V>::new(page, &self.layout);
-            (view.keys().to_vec(), view.values().to_vec(), view.next_leaf())
+            (
+                view.keys().to_vec(),
+                view.values().to_vec(),
+                view.next_leaf(),
+            )
         };
 
         let left_idx = self.store.alloc_page()?;
@@ -925,7 +925,11 @@ where
         let (all_keys, all_values, old_next) = {
             let page = self.store.page(leaf_idx);
             let view = LeafView::<K, V>::new(page, &self.layout);
-            (view.keys().to_vec(), view.values().to_vec(), view.next_leaf())
+            (
+                view.keys().to_vec(),
+                view.values().to_vec(),
+                view.next_leaf(),
+            )
         };
 
         let right_idx = self.store.alloc_page()?;
@@ -992,13 +996,7 @@ where
     // insert_into_internal
     // -----------------------------------------------------------------------
 
-    fn insert_into_internal(
-        &mut self,
-        node_idx: u64,
-        slot: usize,
-        key: K,
-        right_child: u64,
-    ) {
+    fn insert_into_internal(&mut self, node_idx: u64, slot: usize, key: K, right_child: u64) {
         {
             let page = self.store.page_mut(node_idx);
             let mut view = InternalViewMut::<K>::new(page, &self.layout);
@@ -1475,7 +1473,11 @@ where
             let page = self.store.page(right_idx);
             let view = LeafView::<K, V>::new(page, &self.layout);
             let n = view.num_keys();
-            (view.keys()[..n].to_vec(), view.values()[..n].to_vec(), view.next_leaf())
+            (
+                view.keys()[..n].to_vec(),
+                view.values()[..n].to_vec(),
+                view.next_leaf(),
+            )
         };
 
         {
@@ -1512,7 +1514,11 @@ where
             let right_page = self.store.page(right_idx);
             let right_view = InternalView::<K>::new(right_page, &self.layout);
             let rn = right_view.num_keys();
-            (sep, right_view.keys()[..rn].to_vec(), right_view.children()[..rn + 1].to_vec())
+            (
+                sep,
+                right_view.keys()[..rn].to_vec(),
+                right_view.children()[..rn + 1].to_vec(),
+            )
         };
 
         {
@@ -1575,7 +1581,11 @@ pub struct MmapBTreeIter<'a, K, V> {
 impl<'a, K: Ord + Pod, V: Pod> MmapBTreeIter<'a, K, V> {
     fn new(guard: RwLockReadGuard<'a, MmapBTreeInner<K, V>>) -> Self {
         let (current_page, current_slot) = guard.first_leaf();
-        Self { guard, current_page, current_slot }
+        Self {
+            guard,
+            current_page,
+            current_slot,
+        }
     }
 }
 
@@ -1642,7 +1652,12 @@ impl<'a, K: Ord + Pod, V: Pod> MmapBTreeRangeIter<'a, K, V> {
             Bound::Unbounded => guard.first_leaf(),
         };
 
-        Ok(Self { guard, current_page, current_slot, end_bound })
+        Ok(Self {
+            guard,
+            current_page,
+            current_slot,
+            end_bound,
+        })
     }
 }
 
@@ -1733,7 +1748,12 @@ mod tests {
         }
         // Strict ascending order.
         for w in got.windows(2) {
-            assert!(w[0].0 < w[1].0, "iter not ascending: {:?} >= {:?}", w[0].0, w[1].0);
+            assert!(
+                w[0].0 < w[1].0,
+                "iter not ascending: {:?} >= {:?}",
+                w[0].0,
+                w[1].0
+            );
         }
     }
 
@@ -1764,7 +1784,10 @@ mod tests {
     fn builder_creates_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tree.db");
-        MmapBTreeBuilder::<i32, u64>::new().path(&path).build().unwrap();
+        MmapBTreeBuilder::<i32, u64>::new()
+            .path(&path)
+            .build()
+            .unwrap();
         assert!(path.exists());
     }
 
@@ -1854,7 +1877,10 @@ mod tests {
             }
             tree.flush().unwrap();
         }
-        let tree = MmapBTreeBuilder::<i32, i32>::new().path(&path).build().unwrap();
+        let tree = MmapBTreeBuilder::<i32, i32>::new()
+            .path(&path)
+            .build()
+            .unwrap();
         assert_eq!(tree.len().unwrap(), 50);
         for i in 0..50_i32 {
             assert_eq!(tree.get_value(&i).unwrap(), Some(i * 2));
@@ -2138,7 +2164,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tree = open::<i32, Record>(&dir);
         for i in 0..50_i32 {
-            let rec = Record { timestamp: i as u64 * 1000, value: i * -1, flags: i as u32 & 0xFF };
+            let rec = Record {
+                timestamp: i as u64 * 1000,
+                value: i * -1,
+                flags: i as u32 & 0xFF,
+            };
             tree.insert(i, rec).unwrap();
         }
         assert_eq!(tree.len().unwrap(), 50);
@@ -2214,7 +2244,11 @@ mod tests {
         }
         for i in 0..100_i32 {
             assert!(tree.contains_key(&(i * 2)).unwrap(), "even key {}", i * 2);
-            assert!(!tree.contains_key(&(i * 2 + 1)).unwrap(), "odd key {}", i * 2 + 1);
+            assert!(
+                !tree.contains_key(&(i * 2 + 1)).unwrap(),
+                "odd key {}",
+                i * 2 + 1
+            );
         }
     }
 
@@ -2295,7 +2329,11 @@ mod tests {
     fn get_ref_pod_struct_value() {
         let dir = tempfile::tempdir().unwrap();
         let tree = open::<i32, Record>(&dir);
-        let r = Record { timestamp: 999, value: -7, flags: 0xDEAD };
+        let r = Record {
+            timestamp: 999,
+            value: -7,
+            flags: 0xDEAD,
+        };
         tree.insert(42, r).unwrap();
         let got = tree.get(&42).unwrap().unwrap();
         assert_eq!(got.timestamp, 999);
@@ -2474,10 +2512,7 @@ mod tests {
         }
         use std::ops::Bound::*;
         // (5, 10) → keys 6, 7, 8, 9
-        let items: Vec<_> = tree
-            .range((Excluded(5), Excluded(10)))
-            .unwrap()
-            .collect();
+        let items: Vec<_> = tree.range((Excluded(5), Excluded(10))).unwrap().collect();
         assert_eq!(items, vec![(6, 6), (7, 7), (8, 8), (9, 9)]);
     }
 
@@ -2709,9 +2744,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tree = open::<i32, i32>(&dir);
         let n = 1000_i32;
-        let keys: Vec<i32> = (0..n / 2)
-            .flat_map(|i| [i, n - 1 - i])
-            .collect();
+        let keys: Vec<i32> = (0..n / 2).flat_map(|i| [i, n - 1 - i]).collect();
         for &k in &keys {
             tree.insert(k, k * 7).unwrap();
         }
@@ -2815,7 +2848,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("p2.db");
         {
-            let tree = MmapBTreeBuilder::<i32, i32>::new().path(&path).build().unwrap();
+            let tree = MmapBTreeBuilder::<i32, i32>::new()
+                .path(&path)
+                .build()
+                .unwrap();
             for i in 0..100_i32 {
                 tree.insert(i, i * 5).unwrap();
             }
@@ -2826,7 +2862,10 @@ mod tests {
             tree.flush().unwrap();
         }
         // Re-open and verify.
-        let tree = MmapBTreeBuilder::<i32, i32>::new().path(&path).build().unwrap();
+        let tree = MmapBTreeBuilder::<i32, i32>::new()
+            .path(&path)
+            .build()
+            .unwrap();
         for i in 0..100_i32 {
             let expected = if i % 3 == 0 { None } else { Some(i * 5) };
             assert_eq!(tree.get_value(&i).unwrap(), expected, "key {i}");
@@ -2843,22 +2882,41 @@ mod tests {
 
         // Cycle 1: insert 0..100
         {
-            let t = MmapBTreeBuilder::<i32, i32>::new().path(&path).build().unwrap();
-            for i in 0..100_i32 { t.insert(i, i).unwrap(); }
+            let t = MmapBTreeBuilder::<i32, i32>::new()
+                .path(&path)
+                .build()
+                .unwrap();
+            for i in 0..100_i32 {
+                t.insert(i, i).unwrap();
+            }
         }
         // Cycle 2: insert 100..200, remove 0..50
         {
-            let t = MmapBTreeBuilder::<i32, i32>::new().path(&path).build().unwrap();
+            let t = MmapBTreeBuilder::<i32, i32>::new()
+                .path(&path)
+                .build()
+                .unwrap();
             assert_eq!(t.len().unwrap(), 100);
-            for i in 100..200_i32 { t.insert(i, i).unwrap(); }
-            for i in 0..50_i32 { t.remove(&i).unwrap(); }
+            for i in 100..200_i32 {
+                t.insert(i, i).unwrap();
+            }
+            for i in 0..50_i32 {
+                t.remove(&i).unwrap();
+            }
         }
         // Cycle 3: verify final state
         {
-            let t = MmapBTreeBuilder::<i32, i32>::new().path(&path).build().unwrap();
+            let t = MmapBTreeBuilder::<i32, i32>::new()
+                .path(&path)
+                .build()
+                .unwrap();
             assert_eq!(t.len().unwrap(), 150); // 50..200
-            for i in 0..50_i32 { assert_eq!(t.get_value(&i).unwrap(), None); }
-            for i in 50..200_i32 { assert_eq!(t.get_value(&i).unwrap(), Some(i)); }
+            for i in 0..50_i32 {
+                assert_eq!(t.get_value(&i).unwrap(), None);
+            }
+            for i in 50..200_i32 {
+                assert_eq!(t.get_value(&i).unwrap(), Some(i));
+            }
         }
     }
 
@@ -3056,8 +3114,7 @@ mod tests {
         // Plant a WAL for remove(42) as if we crashed before the mmap write.
         let key: i32 = 42;
         let zeros = vec![0u8; std::mem::size_of::<u64>()];
-        wal::write_and_sync(&path, wal::WAL_OP_REMOVE, bytemuck::bytes_of(&key), &zeros)
-            .unwrap();
+        wal::write_and_sync(&path, wal::WAL_OP_REMOVE, bytemuck::bytes_of(&key), &zeros).unwrap();
         // Re-open: WAL recovery removes the key.
         let tree = MmapBTreeBuilder::<i32, u64>::new()
             .path(&path)
@@ -3115,8 +3172,7 @@ mod tests {
         // Plant a remove WAL for key 99, which was never inserted.
         let key: i32 = 99;
         let zeros = vec![0u8; std::mem::size_of::<u64>()];
-        wal::write_and_sync(&path, wal::WAL_OP_REMOVE, bytemuck::bytes_of(&key), &zeros)
-            .unwrap();
+        wal::write_and_sync(&path, wal::WAL_OP_REMOVE, bytemuck::bytes_of(&key), &zeros).unwrap();
         // Re-open: remove of absent key is a no-op, no error.
         let tree = MmapBTreeBuilder::<i32, u64>::new()
             .path(&path)

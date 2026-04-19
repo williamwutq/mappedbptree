@@ -34,7 +34,9 @@ use std::slice;
 
 use bytemuck::Pod;
 
-use crate::storage::{NodeHeader, NodeLayout, NODE_HEADER_SIZE, NODE_KIND_INTERNAL, NODE_KIND_LEAF};
+use crate::storage::{
+    NODE_HEADER_SIZE, NODE_KIND_INTERNAL, NODE_KIND_LEAF, NodeHeader, NodeLayout,
+};
 
 // ---------------------------------------------------------------------------
 // Leaf node — read-only view
@@ -66,7 +68,11 @@ impl<'a, K: Pod, V: Pod> LeafView<'a, K, V> {
             "LeafView constructed on a non-leaf page (kind={})",
             data[0]
         );
-        Self { data, layout, _marker: PhantomData }
+        Self {
+            data,
+            layout,
+            _marker: PhantomData,
+        }
     }
 
     /// Returns a reference to the raw [`NodeHeader`].
@@ -139,7 +145,11 @@ impl<'a, K: Pod, V: Pod> LeafViewMut<'a, K, V> {
     #[inline]
     pub fn new(data: &'a mut [u8], layout: &'a NodeLayout) -> Self {
         debug_assert_eq!(data.len(), layout.page_size, "page slice has wrong length");
-        Self { data, layout, _marker: PhantomData }
+        Self {
+            data,
+            layout,
+            _marker: PhantomData,
+        }
     }
 
     /// Initialises this page as a fresh, empty leaf node.
@@ -261,7 +271,11 @@ impl<'a, K: Pod> InternalView<'a, K> {
             "InternalView constructed on a non-internal page (kind={})",
             data[0]
         );
-        Self { data, layout, _marker: PhantomData }
+        Self {
+            data,
+            layout,
+            _marker: PhantomData,
+        }
     }
 
     /// Returns a reference to the raw [`NodeHeader`].
@@ -322,7 +336,11 @@ impl<'a, K: Pod> InternalViewMut<'a, K> {
     #[inline]
     pub fn new(data: &'a mut [u8], layout: &'a NodeLayout) -> Self {
         debug_assert_eq!(data.len(), layout.page_size);
-        Self { data, layout, _marker: PhantomData }
+        Self {
+            data,
+            layout,
+            _marker: PhantomData,
+        }
     }
 
     /// Initialises this page as a fresh, empty internal node.
@@ -415,7 +433,7 @@ impl<'a, K: Pod> InternalViewMut<'a, K> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{NodeLayout, NULL_PAGE};
+    use crate::storage::{NULL_PAGE, NodeLayout};
 
     fn leaf_layout() -> NodeLayout {
         // K = u32 (4, 4), V = u64 (8, 8)

@@ -135,12 +135,7 @@ pub fn read_existing(
 ///
 /// The `value_bytes` slice must have exactly `value_size` bytes; pass
 /// all-zeros for a `REMOVE` record.
-pub fn write_and_sync(
-    db_path: &Path,
-    op: u8,
-    key_bytes: &[u8],
-    value_bytes: &[u8],
-) -> Result<()> {
+pub fn write_and_sync(db_path: &Path, op: u8, key_bytes: &[u8], value_bytes: &[u8]) -> Result<()> {
     let path = wal_path(db_path);
 
     let mut file = OpenOptions::new()
@@ -198,8 +193,13 @@ mod tests {
         let db = db_path(&dir);
         let key: u32 = 42;
         let val: u64 = 999;
-        write_and_sync(&db, WAL_OP_INSERT,
-            bytemuck::bytes_of(&key), bytemuck::bytes_of(&val)).unwrap();
+        write_and_sync(
+            &db,
+            WAL_OP_INSERT,
+            bytemuck::bytes_of(&key),
+            bytemuck::bytes_of(&val),
+        )
+        .unwrap();
 
         let rec = read_existing(&db, 4, 8).unwrap().unwrap();
         assert_eq!(rec.op, WAL_OP_INSERT);
@@ -213,8 +213,7 @@ mod tests {
         let db = db_path(&dir);
         let key: i32 = -5;
         let zeros = vec![0u8; 8];
-        write_and_sync(&db, WAL_OP_REMOVE,
-            bytemuck::bytes_of(&key), &zeros).unwrap();
+        write_and_sync(&db, WAL_OP_REMOVE, bytemuck::bytes_of(&key), &zeros).unwrap();
 
         let rec = read_existing(&db, 4, 8).unwrap().unwrap();
         assert_eq!(rec.op, WAL_OP_REMOVE);
@@ -254,8 +253,13 @@ mod tests {
         // Write a valid WAL for key_size=4, val_size=8.
         let key: u32 = 1;
         let val: u64 = 2;
-        write_and_sync(&db, WAL_OP_INSERT,
-            bytemuck::bytes_of(&key), bytemuck::bytes_of(&val)).unwrap();
+        write_and_sync(
+            &db,
+            WAL_OP_INSERT,
+            bytemuck::bytes_of(&key),
+            bytemuck::bytes_of(&val),
+        )
+        .unwrap();
         // Try to read it back claiming key_size=8 (mismatch).
         assert!(read_existing(&db, 8, 8).unwrap().is_none());
     }
@@ -266,8 +270,13 @@ mod tests {
         let db = db_path(&dir);
         let key: u32 = 1;
         let val: u32 = 2;
-        write_and_sync(&db, WAL_OP_INSERT,
-            bytemuck::bytes_of(&key), bytemuck::bytes_of(&val)).unwrap();
+        write_and_sync(
+            &db,
+            WAL_OP_INSERT,
+            bytemuck::bytes_of(&key),
+            bytemuck::bytes_of(&val),
+        )
+        .unwrap();
         assert!(wal_path(&db).exists());
         delete(&db).unwrap();
         assert!(!wal_path(&db).exists());

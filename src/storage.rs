@@ -217,13 +217,10 @@ impl NodeLayout {
 
         let leaf_capacity =
             compute_leaf_capacity(page_size, key_start, key_size, value_size, value_align);
-        let leaf_values_start =
-            align_up(key_start + leaf_capacity * key_size, value_align);
+        let leaf_values_start = align_up(key_start + leaf_capacity * key_size, value_align);
 
-        let internal_capacity =
-            compute_internal_capacity(page_size, key_start, key_size);
-        let internal_children_start =
-            align_up(key_start + internal_capacity * key_size, 8);
+        let internal_capacity = compute_internal_capacity(page_size, key_start, key_size);
+        let internal_children_start = align_up(key_start + internal_capacity * key_size, 8);
 
         NodeLayout {
             page_size,
@@ -272,11 +269,7 @@ fn compute_leaf_capacity(
 
 /// Largest `n` such that an internal page with `n` keys and `n + 1` child
 /// pointers (`u64`) fits in `page_size` bytes.
-fn compute_internal_capacity(
-    page_size: usize,
-    key_start: usize,
-    key_size: usize,
-) -> usize {
+fn compute_internal_capacity(page_size: usize, key_start: usize, key_size: usize) -> usize {
     let mut n = 0usize;
     loop {
         let next = n + 1;
@@ -351,6 +344,7 @@ impl MmapStore {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(!file_exists)
             .open(path)
             .map_err(BTreeError::from)?;
 
@@ -404,7 +398,13 @@ impl MmapStore {
 
         let total_pages = hdr.num_pages;
 
-        let mut store = Self { file, mmap, page_size: PAGE_SIZE, total_pages, checksums_enabled: false };
+        let mut store = Self {
+            file,
+            mmap,
+            page_size: PAGE_SIZE,
+            total_pages,
+            checksums_enabled: false,
+        };
 
         if version == 1 {
             // One-time migration: write checksums to all live node pages and
@@ -449,7 +449,13 @@ impl MmapStore {
 
         mmap.flush().map_err(BTreeError::from)?;
 
-        Ok(Self { file, mmap, page_size: PAGE_SIZE, total_pages: 1, checksums_enabled: true })
+        Ok(Self {
+            file,
+            mmap,
+            page_size: PAGE_SIZE,
+            total_pages: 1,
+            checksums_enabled: true,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -584,9 +590,9 @@ impl MmapStore {
     /// `self.mmap`.  The swap through `map_anon(1)` keeps `self.mmap` in a
     /// valid (non-dangling) state at all times during the file extension.
     fn grow(&mut self) -> Result<u64> {
-        let first_new = self.total_pages;           // index of the first new page
+        let first_new = self.total_pages; // index of the first new page
         let new_total = first_new + GROW_BATCH;
-        let new_size  = new_total * self.page_size as u64;
+        let new_size = new_total * self.page_size as u64;
 
         // Swap out the old mapping for a 1-byte anonymous placeholder so that
         // `self.mmap` is never dangling while `set_len` invalidates the file.
@@ -652,7 +658,9 @@ impl MmapStore {
         );
         drop(old_mmap);
 
-        self.file.set_len(PAGE_SIZE as u64).map_err(BTreeError::from)?;
+        self.file
+            .set_len(PAGE_SIZE as u64)
+            .map_err(BTreeError::from)?;
 
         // SAFETY: file was just truncated to PAGE_SIZE; we own it exclusively.
         self.mmap = unsafe { MmapMut::map_mut(&self.file) }.map_err(BTreeError::from)?;
@@ -706,7 +714,9 @@ pub(crate) fn write_page_checksum(page: &mut [u8]) {
 /// uninitialised page as a valid node.
 pub(crate) fn verify_page_checksum(page: &[u8]) -> bool {
     let stored = u32::from_ne_bytes(
-        page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].try_into().unwrap(),
+        page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4]
+            .try_into()
+            .unwrap(),
     );
     stored == page_checksum(page)
 }

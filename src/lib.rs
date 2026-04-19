@@ -51,9 +51,9 @@
 //! truncated (the fsync didn't finish), it is silently ignored and the tree
 //! remains in its clean pre-crash state.
 
-pub mod tree;
-pub(crate) mod storage;
 pub(crate) mod node;
+pub(crate) mod storage;
+pub mod tree;
 pub(crate) mod wal;
 
 pub use tree::{BTreeError, MmapBTree, MmapBTreeBuilder, MmapBTreeValueRef, Result};
